@@ -9,7 +9,8 @@ import streamlit as st
 # APIの設定
 # APIキーは .streamlit/secrets.toml または Streamlit Cloud の Secrets から取得
 API_KEY = st.secrets["GEMINI_API_KEY"]
-MODEL_NAME = "gemini-2.0-flash" 
+# モデル名は、検索機能と構造化出力を一回のリクエストで実行するためにgemini 3以上が必要
+MODEL_NAME = "gemini-3-flash-preview" 
 URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
 def exe_gemini_withGoogleSearch_and_structure(prompt: str, schema: dict = None) -> str:
@@ -77,7 +78,10 @@ def exe_gemini_withGoogleSearch_and_structure(prompt: str, schema: dict = None) 
         
         return "{}"
     except Exception as e:
-        print(f"Gemini API Error: {e}")
+        print(f"DEBUG: Gemini API Error: {e}")
+        if 'response' in locals():
+            print(f"DEBUG: Status Code: {response.status_code}")
+            print(f"DEBUG: Response Text: {response.text}")
         return "{}"
 
 

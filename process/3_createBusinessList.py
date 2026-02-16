@@ -34,10 +34,12 @@ def create_business_list(df_journal: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Dat
     partners = {str(p) for p in partners if pd.notna(p) and str(p).strip() != ""}
     
     partner_list_str = "\n".join(sorted(list(partners)))
+    print(f"DEBUG: Extracted partners: {list(partners)[:5]}...") # 最初の5件のみ
     
     # 2. Googleスプレッドシートからプロンプトを取得
     # auth.pyと同じスプシID。シート名「AIプロンプト」、2行目B列 (index 1, col 1)
-    spreadsheet_id = "1UySgxZ6uPpxwSY9t994k-jsmR6WY-t8AAIrgHcxn0N4"
+    import streamlit as st
+    spreadsheet_id = st.secrets["SPREADSHEET_ID"]
     worksheet_name = "AIプロンプト"
     encoded_worksheet = urllib.parse.quote(worksheet_name)
     csv_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_worksheet}"
@@ -55,6 +57,7 @@ def create_business_list(df_journal: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Dat
     
     # 4. Gemini呼び出し (Google検索 + 構造化)
     structured_json_str = exe_gemini_withGoogleSearch_and_structure(full_prompt)
+    print(f"DEBUG: Gemini raw response: {structured_json_str[:200]}...") # 最初のみ
     
     # 5. DataFrame化
     try:

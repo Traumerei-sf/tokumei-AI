@@ -165,7 +165,7 @@ def show_main():
             st.markdown(f"<div style='text-align: center; color: {color};'><h3>{summary_msg}</h3></div>", unsafe_allow_html=True)
             
             # ③ 画像の挿入 (中央揃え)
-            img_path = r"C:\Users\User\.antigravity\特命AI\assets\特命AI_レポート画像_1.jpeg"
+            img_path = os.path.join("assets", "特命AI_レポート画像_1.jpeg")
             if os.path.exists(img_path):
                 # st.image で中央寄せにするには、カラムを使うかCSS
                 _, img_col, _ = st.columns([1, 2, 1])

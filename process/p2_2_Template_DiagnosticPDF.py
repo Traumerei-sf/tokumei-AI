@@ -28,23 +28,33 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame) -> tuple[bytes, str]:
     pdf.add_page()
     
     # 日本語フォントの設定
+    # 1. assetsフォルダ内のカスタムフォントを優先
+    # 2. Linux (Streamlit Cloud) の一般的なパス
+    # 3. Windows の一般的なパス
     fonts_to_try = [
+        os.path.join("assets", "font.ttf"), # 自分で用意する場合
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
         r"C:\Windows\Fonts\meiryo.ttc",
         r"C:\Windows\Fonts\YuGothR.ttc",
-        r"C:\Windows\Fonts\msmincho.ttc",
-        r"C:\Windows\Fonts\msgothic.ttc",
     ]
     
     font_family = "helvetica"
     for font_path in fonts_to_try:
         if os.path.exists(font_path):
             try:
+                # fpdf2 は .ttc の場合、インデックス指定が必要な場合があるが、まずはシンプルに試行
                 pdf.add_font("JP-Font", "", font_path)
                 font_family = "JP-Font"
                 break
             except Exception as e:
                 print(f"Font loading failed ({font_path}): {e}")
                 continue
+    
+    # フォントが見つからない場合のフォールバック警告（本当はここでエラーにするか代替手段）
+    if font_family == "helvetica":
+        print("WARNING: No Japanese font found. PDF may have character errors.")
     
     pdf.set_font(font_family, size=16)
     
@@ -68,7 +78,7 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame) -> tuple[bytes, str]:
     pdf.ln(5)
     
     # ③ 画像の挿入 (中央揃え)
-    img_path = r"C:\Users\User\.antigravity\特命AI\assets\特命AI_レポート画像_1.jpeg"
+    img_path = os.path.join("assets", "特命AI_レポート画像_1.jpeg")
     if os.path.exists(img_path):
         # ページ中央に配置 (A4横幅は210mm)
         img_width = 80

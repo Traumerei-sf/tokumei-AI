@@ -1,0 +1,2 @@
+fonts-ipafont-gothic
+fonts-ipaexfont-gothic
