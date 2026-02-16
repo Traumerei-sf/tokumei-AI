@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.streamlit/secrets.toml
+*.pyc
+.DS_Store
+# Temporary/Test/Reference data folders
+process/__pycache__/
+test/
+参照資料/
+

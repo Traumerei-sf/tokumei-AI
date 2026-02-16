@@ -1,0 +1,6 @@
+streamlit
+pandas
+openpyxl
+st-gsheets-connection
+fpdf2>=2.7.8
+requests
