@@ -1,8 +1,11 @@
 import streamlit as st
 import pandas as pd
+import os
+import importlib
+from datetime import datetime
+from process.p2_2_Template_DiagnosticPDF import ESSENCE_MAP
 
 def show_main():
-    import os
     # PC前提のワイドレイアウト設定
     st.set_page_config(page_title="特命AI", layout="wide", initial_sidebar_state="collapsed")
     
@@ -48,22 +51,26 @@ def show_main():
         unsafe_allow_html=True,
     )
 
-    # 1. アプリ名（左上）
-    st.markdown('<h1 class="app-title">特命AI</h1>', unsafe_allow_html=True)
+    # 1. アプリ名とアイコン（構成: アイコン[1], タイトル[10]）
+    col_icon, col_title = st.columns([1, 12], vertical_alignment="center")
+
+    with col_icon:
+        st.image("assets/特命AI_ロゴ_osakacapital_900×600.png", width=80)
+
+    with col_title:
+        st.markdown("<h1 style='margin:0;'>特命AI</h1>", unsafe_allow_html=True)
 
     # 2. 説明文（中央揃え）
-    st.markdown(
-        '<div class="description-container">'
-        '<p class="description-text">あなたの12～24か月の会計データから、診断レポートと営業先リストを作成いたします</p>'
-        '</div>', 
-        unsafe_allow_html=True
-    )
+    st.markdown("あなたの12～24か月の会計データから、診断レポートと営業先リストを作成いたします")
 
     # 3. メインアクションエリア (PC向けに中央に寄せる)
     _, col_center, _ = st.columns([1, 2, 1])
 
     with col_center:
         st.markdown("### 会計データのアップロード")
+        st.markdown("※仕訳帳・貸借対照表における項目名は、かならず1行目に配置してください")
+        st.markdown("※貸借対照表をアップロードする場合は、「仕訳帳の最終月」と「貸借対照表の期末月」を合わせてください")
+        st.markdown("※アップロードされた会計データは、診断後すぐに破棄されますのでご安心ください")
         
         # 2つのアップロード枠
         file_journal = st.file_uploader("① 仕訳帳（CSV） 【必須】", type=["csv"], help="必須項目です。")
@@ -85,7 +92,6 @@ def show_main():
                 st.success("解析を開始します。しばらくお待ちください...")
                 
                 # 処理エンジンの呼び出し
-                import importlib
                 process_logic = importlib.import_module("process.1_standardizeAccountingData")
                 standardize_logic = process_logic.standardize_logic
                 check_accounting_files = process_logic.check_accounting_files
@@ -130,6 +136,7 @@ def show_main():
                     # フラグ管理
                     st.session_state["report_ready"] = True
                     st.session_state["biz_list_ready"] = False # まだ
+                    st.session_state["supplier_list_ready"] = False # まだ
                     st.session_state["is_processed"] = True
                     st.rerun() # 画面を更新してプレビューを表示
                     
@@ -160,26 +167,26 @@ def show_main():
             else:
                 summary_msg = "経営の存続に関わる複数の【赤信号】がありました。"
             
-            st.markdown(f"<div style='text-align: center;'><h4>貴社の会計データを「宮田ロジック」で分析した結果</h4>", unsafe_allow_html=True)
+            st.markdown(f"<div style='text-align: center;'><h4>貴社の会計データを「特命AI財務分析ロジック」で分析した結果</h4>", unsafe_allow_html=True)
             color = "red" if red_count > 0 else "black"
             st.markdown(f"<div style='text-align: center; color: {color};'><h3>{summary_msg}</h3></div>", unsafe_allow_html=True)
             
             # ③ 画像の挿入 (中央揃え)
             img_path = os.path.join("assets", "特命AI_レポート画像_1.jpeg")
             if os.path.exists(img_path):
-                # st.image で中央寄せにするには、カラムを使うかCSS
-                _, img_col, _ = st.columns([1, 2, 1])
+                _, img_col, _ = st.columns([1, 3, 1])
                 with img_col:
-                    st.image(img_path, use_container_width=True) # 这里还是用这个，或者宽度
+                    st.image(img_path, width=500)
             
             st.markdown("<br>", unsafe_allow_html=True)
 
             # ④ 指定された3項目のみを抽出
-            target_items = ["現金薄さ", "買掛・未払残高", "仕訳入力遅延"]
-            preview_df = analysis_df[analysis_df["item"].isin(target_items)].copy()
+            # 赤項目を優先し、合計3項目を抽出
+            red_rows = analysis_df[analysis_df["color"] == "red"]
+            other_rows = analysis_df[analysis_df["color"] != "red"]
+            preview_df = pd.concat([red_rows, other_rows]).head(3).copy()
             
             # --- 「問題の本質」の追加 ---
-            from process.p2_2_Template_DiagnosticPDF import ESSENCE_MAP
             preview_df["essence"] = preview_df["item"].map(ESSENCE_MAP)
             
             # 行全体の背景色を設定するスタイル関数
@@ -212,7 +219,6 @@ def show_main():
             st.markdown(st.session_state.get("report_preview_md", "レポートを作成できませんでした。"))
         
         # 5.2 診断レポート ダウンロードボタン
-        from datetime import datetime
         now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         pdf_filename = f"特命AI_診断レポート_{now_str}.pdf"
 
@@ -229,18 +235,17 @@ def show_main():
 
         # --- 営業先リスト作成のバックグラウンド実行（レポート表示後） ---
         if not st.session_state.get("biz_list_ready", False):
-            import importlib
-            with st.status("AIがおすすめ営業先を探しています...", expanded=True) as status:
+            with st.status("AIがおすすめ営業先候補を探しています...", expanded=True) as status:
                 biz_mod = importlib.import_module("process.3_createBusinessList")
                 df_full, df_preview = biz_mod.create_business_list(st.session_state["standardized_journal"])
                 st.session_state["business_list_full"] = df_full
                 st.session_state["business_list_preview"] = df_preview
                 st.session_state["biz_list_ready"] = True
-                status.update(label="営業先リストの作成が完了しました！", state="complete", expanded=False)
+                status.update(label="営業先候補リストの作成が完了しました！", state="complete", expanded=False)
             st.rerun()
 
         # 5.3 営業先リスト プレビュー
-        st.markdown("### 営業先リスト (プレビュー)")
+        st.markdown("### 営業先候補リスト (プレビュー)")
         st.markdown("---")
         
         df_biz_preview = st.session_state.get("business_list_preview")
@@ -264,7 +269,7 @@ def show_main():
                 csv_data = df_biz_full.to_csv(index=False).encode('utf-8')
 
             st.download_button(
-                label="10件全ての新規営業先候補リストをダウンロード",
+                label="全ての新規営業先候補リストをダウンロード",
                 data=csv_data,
                 file_name=csv_filename,
                 mime="text/csv",
@@ -272,3 +277,63 @@ def show_main():
             )
         else:
             st.info("営業先リストは生成されませんでした。")
+
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        st.divider()
+
+        # --- 仕入先リスト作成のバックグラウンド実行 ---
+        if st.session_state.get("biz_list_ready", False) and not st.session_state.get("supplier_list_ready", False):
+            with st.status("AIがおすすめ仕入先候補を探しています...", expanded=True) as status:
+                biz_mod = importlib.import_module("process.3_createBusinessList")
+                df_full_s, df_prev_s = biz_mod.create_supplier_list(st.session_state["standardized_journal"])
+                st.session_state["supplier_list_full"] = df_full_s
+                st.session_state["supplier_list_preview"] = df_prev_s
+                st.session_state["supplier_list_ready"] = True
+                status.update(label="仕入先候補リストの作成が完了しました！", state="complete", expanded=False)
+            st.rerun()
+
+        # 5.5 仕入先リスト プレビュー
+        st.markdown("### 仕入先候補リスト (プレビュー)")
+        st.markdown("---")
+        
+        df_sup_preview = st.session_state.get("supplier_list_preview")
+        df_sup_full = st.session_state.get("supplier_list_full")
+
+        if df_sup_preview is not None:
+            st.dataframe(
+                df_sup_preview,
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            # 5.6 仕入先リスト ダウンロードボタン
+            csv_now_str_s = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            csv_filename_s = f"特命AI_仕入先候補リスト_{csv_now_str_s}.csv"
+            
+            try:
+                csv_data_s = df_sup_full.to_csv(index=False).encode('utf-8-sig')
+            except:
+                csv_data_s = df_sup_full.to_csv(index=False).encode('utf-8')
+
+            st.download_button(
+                label="全ての新規仕入先候補リストをダウンロード",
+                data=csv_data_s,
+                file_name=csv_filename_s,
+                mime="text/csv",
+                use_container_width=True
+            )
+        else:
+            st.info("仕入先リストは生成されませんでした。")
+
+    # 6. フッター
+    st.markdown("<br><br><br>", unsafe_allow_html=True)
+    st.divider()
+    st.markdown(
+        """
+        <div style="text-align: center; color: #888888; font-size: 0.9rem; padding-bottom: 2rem;">
+            大阪キャピタル株式会社<br>
+            〒103-0026 東京都中央区日本橋兜町５－１兜町第一平和ビル３階
+        </div>
+        """,
+        unsafe_allow_html=True
+    )

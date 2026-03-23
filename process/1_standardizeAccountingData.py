@@ -25,20 +25,19 @@ from typing import Optional, Dict, List
 # --- 定数定義 ---
 STANDARD_JOURNAL_COLUMNS = [
     "date", "debit_account", "debit_amount", "debit_partner",
-    "credit_account", "credit_amount", "credit_partner", "created_at", "quantity"
+    "credit_account", "credit_amount", "credit_partner", "created_at"
 ]
 
 # 表記ゆれ吸収用マッパー
 HEADER_MAPPING = {
-    "date": ["日付", "年月日", "取引日", "発生日", "Date", "Transaction Date"],
-    "debit_account": ["借方科目", "借方勘定科目", "借方勘定", "Debit Account"],
-    "debit_amount": ["借方金額", "借方", "Debit Amount"],
-    "debit_partner": ["借方取引先", "借方補助科目", "借方取引先名", "Debit Partner"],
-    "credit_account": ["貸方科目", "貸方勘定科目", "貸方勘定", "Credit Account"],
-    "credit_amount": ["貸方金額", "貸方", "Credit Amount"],
-    "credit_partner": ["貸方取引先", "貸方補助科目", "貸方取引先名", "Credit Partner"],
-    "created_at": ["作成日", "作成日時", "登録日", "登録日時", "入力日", "入力日時", "仕分日", "仕分日時", "Created At"],
-    "quantity": ["数量", "個数", "Qty", "Quantity"]
+    "date": ["日付", "年月日", "取引日", "発生日", "取引日付", "日付 yyyy/MM/dd（必須）", "伝票日付"],
+    "debit_account": ["借方科目", "借方科目名", "借方科目名称", "借方勘定科目"],
+    "debit_amount": ["借方金額", "借方金額(円)", "借方金額（必須）", "金額"],
+    "debit_partner": ["借方取引先", "摘要", "取引摘要", "行摘要"],
+    "credit_account": ["貸方科目", "貸方科目名", "貸方科目名称", "貸方勘定科目"],
+    "credit_amount": ["貸方金額", "貸方金額(円)", "貸方金額（必須）", "金額"],
+    "credit_partner": ["貸方取引先", "摘要", "取引摘要", "行摘要"],
+    "created_at": ["作成日時", "入力日付時間", "入力日付", "登録日時", "入力日", "入力日時", "仕分日", "仕分日時", "Created At"],
 }
 
 def validate_accounting_data(df: pd.DataFrame) -> bool:
@@ -51,14 +50,65 @@ def validate_accounting_data(df: pd.DataFrame) -> bool:
 def _map_headers(df: pd.DataFrame) -> pd.DataFrame:
     """
     マスタに基づいてヘッダーを標準名に変換する。
+    重複するマッピングが発生した場合は、最初に一致したものを優先する。
     """
     rename_dict = {}
-    for col in df.columns:
+    used_std_names = set()
+    
+    # 完全に一致するものを優先してマッピング
+    cols = list(df.columns)
+    for col in cols:
+        col_str = str(col).strip()
+        # pandasの重複カラム名「.1」「.2」等を除去して比較
+        import re
+        base_col = re.sub(r'\.\d+$', '', col_str)
+        
         for std_name, aliases in HEADER_MAPPING.items():
-            if col in aliases:
+            if std_name in used_std_names:
+                continue
+            if col_str in aliases or base_col in aliases:
                 rename_dict[col] = std_name
+                used_std_names.add(std_name)
                 break
+                
+    # 部分一致やより柔軟な判定（金額や科目など、必須項目がまだ見つからない場合）
+    for col in cols:
+        if col in rename_dict: continue
+        col_str = str(col).strip()
+        
+        for std_name, aliases in HEADER_MAPPING.items():
+            if std_name in used_std_names:
+                continue
+            # 非常に限定的な部分一致（誤爆を防ぐため）
+            if std_name == "debit_amount" and ("借方" in col_str and "金額" in col_str):
+                rename_dict[col] = std_name
+                used_std_names.add(std_name)
+                break
+            if std_name == "credit_amount" and ("貸方" in col_str and "金額" in col_str):
+                rename_dict[col] = std_name
+                used_std_names.add(std_name)
+                break
+                
     return df.rename(columns=rename_dict)
+
+def _find_header_row(file_journal: io.BytesIO, encoding: str) -> int:
+    """
+    「日付」「借方」「貸方」などのキーワードを含む行を探し、ヘッダー行のインデックスを返す。
+    見つからない場合は0を返す。
+    """
+    file_journal.seek(0)
+    try:
+        # 最初の10行程度を確認
+        df_top = pd.read_csv(file_journal, nrows=10, header=None, encoding=encoding)
+        for i, row in df_top.iterrows():
+            row_str = "".join(row.astype(str).values)
+            if ("日付" in row_str or "年月" in row_str or "取引日" in row_str) and \
+               ("借方" in row_str or "科目" in row_str) and \
+               ("金額" in row_str):
+                return i
+    except:
+        pass
+    return 0
 
 def _flatten_journal(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -116,16 +166,25 @@ def check_accounting_files(file_journal: io.BytesIO, file_bs: Optional[io.BytesI
             })
             return results
         
-        # 全セルを文字列結合して検索
+        # 全セルをリスト化
         head_text = df_head.astype(str).values.flatten().tolist()
-        head_combined = "".join(head_text)
         
+        # 借方・貸方チェック（既存のロジックを維持：部分一致）
+        head_combined = "".join(head_text)
         has_debit = "借方" in head_combined
         has_credit = "貸方" in head_combined
         
-        if not (has_debit and has_credit):
+        # 取引日チェック（新規追加：完全一致）
+        date_aliases = HEADER_MAPPING["date"]
+        has_date = any(alias in head_text for alias in date_aliases)
+        
+        if not (has_debit and has_credit and has_date):
+            missing = []
+            if not (has_debit and has_credit): missing.append("「借方」「貸方」")
+            if not has_date: missing.append("「日付」関連（取引日、年月日等）")
+            
             results.append({
-                "message": "仕訳帳のヘッダー（1〜2行目）に「借方」「貸方」が含まれていません",
+                "message": f"仕訳帳のヘッダー（1〜2行目）に必要な項目（{', '.join(missing)}）が含まれていません",
                 "color": "red",
                 "success": False
             })
@@ -150,16 +209,17 @@ def check_accounting_files(file_journal: io.BytesIO, file_bs: Optional[io.BytesI
             })
             return results
 
-        # 「取引日」列を検索
+        # 日付列を検索（HEADER_MAPPING["date"]のいずれかと完全一致）
         date_col = None
+        date_aliases = HEADER_MAPPING["date"]
         for col in df_journal.columns:
-            if "取引日" in str(col):
+            if str(col) in date_aliases:
                 date_col = col
                 break
         
         if date_col is None:
             results.append({
-                "message": "仕訳帳に「取引日」という名称の列が見つかりません",
+                "message": "仕訳帳に有効な日付列（日付、取引日、年月日等）が見つかりません",
                 "color": "red",
                 "success": False
             })
@@ -332,18 +392,31 @@ def standardize_logic(file_journal: io.BytesIO, file_ledger: Optional[io.BytesIO
     """
     アップロードされたファイルを読み込み、標準化されたDataFrameの辞書を返す。
     """
-    # 1. 仕訳帳の読み込み
+    # 1. ヘッダー行の自動判定と読み込み
     df_j = None
     for enc in ['utf-8-sig', 'cp932', 'utf-8', 'shift_jis']:
         try:
+            skip_rows = _find_header_row(file_journal, enc)
             file_journal.seek(0)
-            df_j = pd.read_csv(file_journal, encoding=enc)
-            break
-        except:
+            df_j = pd.read_csv(file_journal, encoding=enc, skiprows=skip_rows)
+            
+            # 正常に読み込めたか、最低限の項目チェック
+            mapped_temp = _map_headers(df_j)
+            if "date" in mapped_temp.columns and ("debit_amount" in mapped_temp.columns or "credit_amount" in mapped_temp.columns):
+                break # 成功
+            else:
+                # 判定に失敗した場合はskiprows=0で再試行してみる
+                file_journal.seek(0)
+                df_j = pd.read_csv(file_journal, encoding=enc)
+                mapped_temp = _map_headers(df_j)
+                if "date" in mapped_temp.columns:
+                    break
+        except Exception as e:
+            print(f"Read error with {enc}: {e}")
             continue
 
-    if df_j is None:
-        raise ValueError("仕訳帳の読み込みに失敗しました（文字コードエラー）")
+    if df_j is None or df_j.empty:
+        raise ValueError("仕訳帳の読み込みに失敗しました。ファイルが空か、対応していない形式です。")
     
     # 2. ヘッダーの名寄せ
     df_j = _map_headers(df_j)

@@ -3,6 +3,7 @@ import io
 import os
 from fpdf import FPDF
 from fpdf.fonts import FontFace
+import datetime
 
 # 「問題の本質」の定型文マッピング
 ESSENCE_MAP = {
@@ -15,11 +16,10 @@ ESSENCE_MAP = {
     "新規継続率": "新規客が定着しないのは、商品力や初期対応の満足度に課題があるためです。釣り上げた魚を逃さない仕組みの構築が急務です。",
     "粗利率トレンド": "緩やかな粗利率の下落は、競合過多や生産性低下のサインです。価格競争に巻き込まれない独自の価値提供を再定義する時期です。",
     "上位3社売上集中度": "特定顧客への依存は、経営の生殺与奪の権を他者に委ねることと同じです。不測の事態に備え、収益の柱を分散させる戦略が不可欠です。",
-    "上位3社仕入集中度": "仕入先の固定化は、コスト削減の機会損失や、供給停止リスクを孕みます。常に代替案を持ち、交渉力を維持する姿勢が求められます。",
-    "単価上昇率": "仕入単価の上昇を価格転嫁できない体質は、利益を蝕み続けます。コスト増を吸収する付加価値の向上か、価格改定の決断が迫られています。"
+    "上位3社仕入集中度": "仕入先の固定化は、コスト削減の機会損失や、供給停止リスクを孕みます。常に代替案を持ち、交渉力を維持する姿勢が求められます。"
 }
 
-def render_diagnostic_pdf(analysis_df: pd.DataFrame) -> tuple[bytes, str]:
+def render_diagnostic_pdf(analysis_df: pd.DataFrame, accounting_period: str) -> tuple[bytes, str]:
     """
     分析結果のDataFrameから、PDFデータ（バイナリ）とプレビュー用テキスト（Markdown）を生成する。
     """
@@ -27,7 +27,7 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame) -> tuple[bytes, str]:
     pdf = FPDF()
     pdf.add_page()
     
-    # 日本語フォントの設定
+    # 日本語フォントの設定 (中略)
     # 1. assetsフォルダ内のカスタムフォントを優先
     # 2. Linux (Streamlit Cloud) の一般的なパス
     # 3. Windows の一般的なパス
@@ -56,6 +56,12 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame) -> tuple[bytes, str]:
     if font_family == "helvetica":
         print("WARNING: No Japanese font found. PDF may have character errors.")
     
+    pdf.set_font(font_family, size=9)
+    today_str = datetime.datetime.now().strftime("%Y年%m月%d日")
+    pdf.cell(0, 5, f"作成日時：{today_str}", new_x="LMARGIN", new_y="NEXT", align="R")
+    pdf.cell(0, 5, f"会計期間：{accounting_period}", new_x="LMARGIN", new_y="NEXT", align="R")
+    pdf.ln(5)
+    
     pdf.set_font(font_family, size=16)
     
     # ① タイトル
@@ -71,7 +77,7 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame) -> tuple[bytes, str]:
         summary_msg = "経営の存続に関わる複数の【赤信号】がありました。"
     
     pdf.set_font_size(12)
-    pdf.cell(0, 10, f"貴社の会計データを「宮田ロジック」で分析した結果", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 10, f"貴社の会計データを「特命AI財務分析ロジック」で分析した結果", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.set_text_color(255, 0, 0) if red_count > 0 else pdf.set_text_color(0, 0, 0)
     pdf.cell(0, 10, summary_msg, new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.set_text_color(0, 0, 0)
@@ -81,7 +87,7 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame) -> tuple[bytes, str]:
     img_path = os.path.join("assets", "特命AI_レポート画像_1.jpeg")
     if os.path.exists(img_path):
         # ページ中央に配置 (A4横幅は210mm)
-        img_width = 80
+        img_width = 40
         pdf.image(img_path, x=(210 - img_width) / 2, w=img_width)
         pdf.ln(5)
 
@@ -117,7 +123,7 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame) -> tuple[bytes, str]:
     # テーブルの描画 (fpdf2のtable機能を使用)
     with pdf.table(
         width=190, 
-        col_widths=(25, 30, 20, 55, 60),
+        col_widths=(15, 25, 15, 35, 100),
         text_align=("LEFT", "LEFT", "CENTER", "LEFT", "LEFT"),
         borders_layout="ALL",
         line_height=6,
@@ -158,11 +164,14 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame) -> tuple[bytes, str]:
     preview_md = f"### {summary_msg}\n\n"
     preview_md += "| 評価項目 | 結果 | コメント |\n| :--- | :--- | :--- |\n"
     
-    target_items = ["現金薄さ", "買掛・未払残高", "仕訳入力遅延"]
-    for _, row in analysis_df.iterrows():
-        if row["item"] in target_items:
-            color_val = str(row.get("color", "grey"))
-            emoji = "🔴" if color_val == "red" else "🔵" if color_val == "blue" else "⚪"
-            preview_md += f"| {row['item']} | {emoji} {row['result']} | {row['comment']} |\n"
+    # 赤項目を優先して3項目を抽出
+    red_rows = analysis_df[analysis_df["color"] == "red"]
+    other_rows = analysis_df[analysis_df["color"] != "red"]
+    preview_rows = pd.concat([red_rows, other_rows]).head(3)
+
+    for _, row in preview_rows.iterrows():
+        color_val = str(row.get("color", "grey"))
+        emoji = "🔴" if color_val == "red" else "🔵" if color_val == "blue" else "⚪"
+        preview_md += f"| {row['item']} | {emoji} {row['result']} | {row['comment']} |\n"
     
     return pdf_bytes, preview_md

@@ -182,22 +182,5 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> pd.DataFr
     else:
         results.append(["④ 仕入コスト", "上位3社仕入集中度", "なし", "取引先別の仕入データがありません", "grey"])
 
-    # 4.2 単価上昇率
-    if months_count >= 13 and 'quantity' in df_j.columns and df_j['quantity'].notna().any():
-        # 仕入行の単価（amount / quantity）を計算
-        df_curr['unit_price'] = df_curr['cogs_amt'] / df_curr['quantity'].replace(0, np.nan)
-        df_prev['unit_price'] = df_prev['cogs_amt'] / df_prev['quantity'].replace(0, np.nan)
-        
-        avg_price_curr = df_curr['unit_price'].mean()
-        avg_price_prev = df_prev['unit_price'].mean()
-        
-        if avg_price_prev > 0:
-            price_increase = (avg_price_curr / avg_price_prev - 1) * 100
-            results.append(["④ 仕入コスト", "単価上昇率", f"{price_increase:+.1f}%", f"仕入平均単価が前年比で{price_increase:+.1f}%変動しています", "red" if price_increase >= 10 else "blue"])
-        else:
-            results.append(["④ 仕入コスト", "単価上昇率", "判定不可", "前年の価格データが不足しています", "grey"])
-    else:
-        results.append(["④ 仕入コスト", "単価上昇率", "なし", "数量データ（quantity列）がないため判定できません", "grey"])
-
     # DataFrame化して返却
     return pd.DataFrame(results, columns=["category", "item", "result", "comment", "color"])

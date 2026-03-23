@@ -30,11 +30,12 @@ def exe_gemini_withGoogleSearch_and_structure(prompt: str, schema: dict = None) 
                         "properties": {
                             "会社名": { "type": "STRING" },
                             "ホームページURL": { "type": "STRING" },
+                            "メールアドレス": { "type": "STRING" },
                             "業種": { "type": "STRING" },
                             "事業内容": { "type": "STRING" },
                             "登記地域": { "type": "STRING" }
                         },
-                        "required": ["会社名", "ホームページURL", "業種", "事業内容", "登記地域"]
+                        "required": ["会社名", "ホームページURL", "メールアドレス", "業種", "事業内容", "登記地域"]
                     }
                 }
             },
