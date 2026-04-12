@@ -270,7 +270,6 @@ def show_main():
                             bs_invalid = True
 
                 if not bs_invalid:
-                    st.session_state["is_processed"] = True
                     st.success("解析を開始します。しばらくお待ちください...")
                     
                     try:
