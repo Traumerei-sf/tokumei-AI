@@ -1,447 +1,296 @@
-# 目的と全体像：全会計データを標準化し、後続の「診断レポート作成」と「営業先リスト作成」に渡せるようにする
-# 引数：ユーザーからアップロードされた各種会計データ。
-# 処理：①アップロードされた会計データが正しいか判断する。②会計データの形式を標準化する。③メイン関数に返す
-# 返り値：標準化された会計データ（データ形式未定。csv系か？）
-
-# 関数構成予定：
-#①会計データ正しいか判断：前提として、仕訳帳（必須）、総勘定元帳（任意）、貸借対照表（任意）、損益計算書（任意）が引数として与えられる。ただし、必須の仕訳帳は必ず引数として与えられているものとする
-# 各会計データに関して、エクスポート元の会計ソフトによって項目名が若干異なる可能性がある。
-# ひとまずここでは、各会計データに関して、必須で存在すると思われる項目が存在するかどうかを判断する。できれば各会計データに対して3-4つ程度の項目でデータが正しいかの✅をしてほしい
-#①の処理について、もし正しくない場合は、のちの処理をスキップしてメイン画面に「会計データが正しくありません」などのエラー文を表示する。エラーの可能性はもう一つあって、仕訳帳における会計データが12-24か月以内でない場合もエラーを返すようにする。この時の文言は先ほどとは違う。
-#①の処理で問題ない場合は、「会計データは正常です。診断を開始します」とメイン画面に表示したうえで、内部的には②の処理に進む
-
-#②会計データの形式を標準化する：
-# ここが非常に難しいところである。
-# まず、それぞれの会計データに対して、宮田ロジックに渡すためのデータ構造（csvまたはjson的な構造）を定義するべきである。
-# その後、各会計データをそのデータ構造に変換する。
-# このとき例えば仕訳帳の中で「取引日」や「借方金額」といった項目があるが、これが会計ソフトによって微妙に異なる可能性がある。
-# これを踏まえ、各項目に対して、表記揺れを吸収できるような処理を実装する。
-# 
-
 import pandas as pd
 import io
-from typing import Optional, Dict, List
+import json
+import re
+from typing import Optional, Dict, List, Tuple
+from process.u_accessGemini import exe_gemini_structure_forJournal, exe_gemini_structure_forBS
 
 # --- 定数定義 ---
 STANDARD_JOURNAL_COLUMNS = [
-    "date", "debit_account", "debit_amount", "debit_partner",
-    "credit_account", "credit_amount", "credit_partner", "created_at"
+    "date", "debit_account", "debit_amount", "credit_account", "credit_amount", "partner", "created_at"
 ]
 
-# 表記ゆれ吸収用マッパー
-HEADER_MAPPING = {
-    "date": ["日付", "年月日", "取引日", "発生日", "取引日付", "日付 yyyy/MM/dd（必須）", "伝票日付"],
-    "debit_account": ["借方科目", "借方科目名", "借方科目名称", "借方勘定科目"],
-    "debit_amount": ["借方金額", "借方金額(円)", "借方金額（必須）", "金額"],
-    "debit_partner": ["借方取引先", "摘要", "取引摘要", "行摘要"],
-    "credit_account": ["貸方科目", "貸方科目名", "貸方科目名称", "貸方勘定科目"],
-    "credit_amount": ["貸方金額", "貸方金額(円)", "貸方金額（必須）", "金額"],
-    "credit_partner": ["貸方取引先", "摘要", "取引摘要", "行摘要"],
-    "created_at": ["作成日時", "入力日付時間", "入力日付", "登録日時", "入力日", "入力日時", "仕分日", "仕分日時", "Created At"],
-}
-
-def validate_accounting_data(df: pd.DataFrame) -> bool:
+def load_file_to_df(file: io.BytesIO) -> pd.DataFrame:
     """
-    会計データが最低限必要な情報（日付、科目、金額）を持っているか判定する。
+    ファイルを読み込み DataFrame に変換する (1番目のシート)
     """
-    required = ["date", "debit_account", "debit_amount", "credit_account", "credit_amount"]
-    return all(col in df.columns for col in required)
-
-def _map_headers(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    マスタに基づいてヘッダーを標準名に変換する。
-    重複するマッピングが発生した場合は、最初に一致したものを優先する。
-    """
-    rename_dict = {}
-    used_std_names = set()
+    file.seek(0)
+    filename = getattr(file, "name", "").lower()
     
-    # 完全に一致するものを優先してマッピング
-    cols = list(df.columns)
-    for col in cols:
-        col_str = str(col).strip()
-        # pandasの重複カラム名「.1」「.2」等を除去して比較
-        import re
-        base_col = re.sub(r'\.\d+$', '', col_str)
-        
-        for std_name, aliases in HEADER_MAPPING.items():
-            if std_name in used_std_names:
+    if filename.endswith(".xlsx"):
+        return pd.read_excel(file, sheet_name=0)
+    else:
+        # CSV の場合はエンコーディングを試行
+        for enc in ['utf-8-sig', 'cp932', 'utf-8', 'shift_jis']:
+            try:
+                file.seek(0)
+                return pd.read_csv(file, encoding=enc)
+            except:
                 continue
-            if col_str in aliases or base_col in aliases:
-                rename_dict[col] = std_name
-                used_std_names.add(std_name)
-                break
-                
-    # 部分一致やより柔軟な判定（金額や科目など、必須項目がまだ見つからない場合）
-    for col in cols:
-        if col in rename_dict: continue
-        col_str = str(col).strip()
-        
-        for std_name, aliases in HEADER_MAPPING.items():
-            if std_name in used_std_names:
-                continue
-            # 非常に限定的な部分一致（誤爆を防ぐため）
-            if std_name == "debit_amount" and ("借方" in col_str and "金額" in col_str):
-                rename_dict[col] = std_name
-                used_std_names.add(std_name)
-                break
-            if std_name == "credit_amount" and ("貸方" in col_str and "金額" in col_str):
-                rename_dict[col] = std_name
-                used_std_names.add(std_name)
-                break
-                
-    return df.rename(columns=rename_dict)
-
-def _find_header_row(file_journal: io.BytesIO, encoding: str) -> int:
-    """
-    「日付」「借方」「貸方」などのキーワードを含む行を探し、ヘッダー行のインデックスを返す。
-    見つからない場合は0を返す。
-    """
-    file_journal.seek(0)
-    try:
-        # 最初の10行程度を確認
-        df_top = pd.read_csv(file_journal, nrows=10, header=None, encoding=encoding)
-        for i, row in df_top.iterrows():
-            row_str = "".join(row.astype(str).values)
-            if ("日付" in row_str or "年月" in row_str or "取引日" in row_str) and \
-               ("借方" in row_str or "科目" in row_str) and \
-               ("金額" in row_str):
-                return i
-    except:
-        pass
-    return 0
+    raise ValueError("ファイル形式が csv または xlsx ではありません。")
 
 def _flatten_journal(df: pd.DataFrame) -> pd.DataFrame:
     """
     借方・貸方に分かれた仕訳データを、1レコード1科目のフラットな形式に変換する。
+    (診断ロジックの内部で使用される可能性があるため残す)
     """
-    # 貸借分離型（借方科目/貸方科目の列がある場合）か判定
     if "debit_account" in df.columns and "credit_account" in df.columns:
-        # 借方データを抽出
-        debit_df = df.copy()
-        debit_df["account"] = debit_df["debit_account"]
-        debit_df["amount"] = debit_df["debit_amount"]
+        common_cols = [c for c in df.columns if c not in ["debit_account", "debit_amount", "credit_account", "credit_amount"]]
+        # 借方
+        debit_df = df[common_cols].copy()
+        debit_df["account"] = df["debit_account"]
+        debit_df["amount"] = df["debit_amount"]
         debit_df["side"] = "debit"
-        
-        # 貸方データを抽出
-        credit_df = df.copy()
-        credit_df["account"] = credit_df["credit_account"]
-        credit_df["amount"] = credit_df["credit_amount"]
+        # 貸方
+        credit_df = df[common_cols].copy()
+        credit_df["account"] = df["credit_account"]
+        credit_df["amount"] = df["credit_amount"]
         credit_df["side"] = "credit"
-        
-        # 結合
         flat_df = pd.concat([debit_df, credit_df], ignore_index=True)
-    else:
-        # すでにフラットな場合や不明な場合はそのまま（sideなしならデフォルトdebitとする等）
-        flat_df = df.copy()
-        if "side" not in flat_df.columns:
-            flat_df["side"] = "unknown"
-            
-    return flat_df[flat_df["account"].notna()]
+        return flat_df[flat_df["account"].notna()]
+    return df
 
-def check_accounting_files(file_journal: io.BytesIO, file_bs: Optional[io.BytesIO] = None) -> List[Dict]:
+def process_journal_single(file: io.BytesIO, file_num: int = 1) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     """
-    会計データのバリデーションを行う。
-    結果のリスト（メッセージ、色、続行可否）を返す。
+    1枚の仕訳帳ファイルを処理する。
+    返り値: (DataFrame, ErrorMessage) ※レポート作成用にWide形式で返す。
     """
-    results = []
-    
-    # --- 1. 仕訳帳の確認 ---
     try:
-        # A: 1-2行目のキーワードチェック
-        file_journal.seek(0)
-        df_head = None
-        for enc in ['utf-8-sig', 'cp932', 'utf-8', 'shift_jis']:
-            try:
-                file_journal.seek(0)
-                df_head = pd.read_csv(file_journal, nrows=2, header=None, encoding=enc)
-                break
-            except:
-                continue
-        
-        if df_head is None:
-            results.append({
-                "message": "仕訳帳の読み込みに失敗しました（文字コードエラー）",
-                "color": "red",
-                "success": False
-            })
-            return results
-        
-        # 全セルをリスト化
-        head_text = df_head.astype(str).values.flatten().tolist()
-        
-        # 借方・貸方チェック（既存のロジックを維持：部分一致）
-        head_combined = "".join(head_text)
-        has_debit = "借方" in head_combined
-        has_credit = "貸方" in head_combined
-        
-        # 取引日チェック（新規追加：完全一致）
-        date_aliases = HEADER_MAPPING["date"]
-        has_date = any(alias in head_text for alias in date_aliases)
-        
-        if not (has_debit and has_credit and has_date):
-            missing = []
-            if not (has_debit and has_credit): missing.append("「借方」「貸方」")
-            if not has_date: missing.append("「日付」関連（取引日、年月日等）")
-            
-            results.append({
-                "message": f"仕訳帳のヘッダー（1〜2行目）に必要な項目（{', '.join(missing)}）が含まれていません",
-                "color": "red",
-                "success": False
-            })
-            return results
+        # 1. 読み込み
+        df_raw = load_file_to_df(file)
+        if df_raw.empty:
+            return None, "ファイルが空です。"
 
-        # B: 期間チェック (12-24ヶ月)
-        file_journal.seek(0)
-        df_journal = None
-        for enc in ['utf-8-sig', 'cp932', 'utf-8', 'shift_jis']:
-            try:
-                file_journal.seek(0)
-                df_journal = pd.read_csv(file_journal, encoding=enc)
-                break
-            except:
-                continue
-
-        if df_journal is None:
-            results.append({
-                "message": "仕訳帳の読み込みに失敗しました（文字コードエラー）",
-                "color": "red",
-                "success": False
-            })
-            return results
-
-        # 日付列を検索（HEADER_MAPPING["date"]のいずれかと完全一致）
-        date_col = None
-        date_aliases = HEADER_MAPPING["date"]
-        for col in df_journal.columns:
-            if str(col) in date_aliases:
-                date_col = col
-                break
+        # 2. Gemini へのプロンプト作成
+        sample_data = df_raw.head(15).astype(str).values.tolist()
+        columns_info = list(df_raw.columns.astype(str))
         
-        if date_col is None:
-            results.append({
-                "message": "仕訳帳に有効な日付列（日付、取引日、年月日等）が見つかりません",
-                "color": "red",
-                "success": False
-            })
-            return results
+        prompt = f"""
+あなたはプロの会計士でありデータアナリストです。
+提供された会計データ（仕訳帳）のサンプルから、各項目が「何列目」にあるかと、「実データが何行目から始まるか」を特定してください。
 
-        df_journal[date_col] = pd.to_datetime(df_journal[date_col], errors='coerce')
-        df_journal = df_journal[df_journal[date_col].notna()]
-        
-        if df_journal.empty:
-            results.append({
-                "message": "仕訳帳の「取引日」列に有効な日付データが見つかりませんでした",
-                "color": "red",
-                "success": False
-            })
-            return results
-            
-        min_date = df_journal[date_col].min()
-        max_date = df_journal[date_col].max()
-        
-        # 月数の計算
-        months = (max_date.year - min_date.year) * 12 + (max_date.month - min_date.month)
-        
-        # ユーザー要件: 12か月以上24か月以内
-        if 11 <= months <= 23:
-            results.append({
-                "message": "仕訳帳は正常です。処理を続けます",
-                "color": "green",
-                "success": True
-            })
-        else:
-            results.append({
-                "message": f"仕訳帳のデータ期間が12ヶ月〜24ヶ月の範囲外です（現在の期間: {months}ヶ月）",
-                "color": "red",
-                "success": False
-            })
-            return results
+【項目定義】
+- date: 取引日（日付）
+- debit_account: 借方勘定科目
+- debit_amount: 借方金額
+- credit_account: 貸方勘定科目
+- credit_amount: 貸方金額
+- partner: 取引先名称や摘要（相手先）。借方・貸方などの区別は不要で、その取引行の代表的な1列だけを特定してください。
+- created_at: 作成日時/入力日時（作成日時, 入力日付時間, 入力日付, 登録日時, 入力日, 入力日時, 仕分日, 仕分日時, Created At 等）
 
-    except Exception as e:
-        results.append({
-            "message": f"仕訳帳のチェック中に想定外のエラーが発生しました: {str(e)}",
-            "color": "red",
-            "success": False
-        })
-        return results
+【サンプルデータ】
+ヘッダー候補: {columns_info}
+データサンプル（最初の15行）:
+{json.dumps(sample_data, ensure_ascii=False, indent=2)}
 
-    # --- 2. 貸借対照表の確認 ---
-    if file_bs is None:
-        results.append({
-            "message": "貸借対照表は無しで分析を開始します",
-            "color": "black",
-            "success": True
-        })
-    else:
+【ルール】
+- 列番号は0からカウントしてください。
+- 該当する項目が見当たらない場合は null を返してください。
+- date, debit_account, debit_amount, credit_account, credit_amount は必須項目です。
+- data_start_row は、ヘッダーを除く実際のデータ（1件目の取引）が始まる「元のデータの行番号」を指定してください。
+"""
+        
+        # 3. Gemini 呼び出し
+        print("--- DEBUG: Gemini Prompt (created_at inclusion) ---")
+        response_json = exe_gemini_structure_forJournal(prompt)
+        print(f"--- DEBUG: Gemini Raw Response ---\n{response_json}")
+
         try:
-            file_bs.seek(0)
-            df_bs = None
-            for enc in ['utf-8-sig', 'cp932', 'utf-8', 'shift_jis']:
-                try:
-                    file_bs.seek(0)
-                    df_bs = pd.read_csv(file_bs, header=None, encoding=enc)
-                    break
-                except:
-                    continue
-
-            if df_bs is None:
-                results.append({
-                    "message": "貸借対照表の読み込みに失敗しました（文字コードエラー）",
-                    "color": "red",
-                    "success": False
-                })
-                return results
-            
-            # 全データの中から「現金」または「預金」を探す
-            bs_combined = "".join(df_bs.astype(str).values.flatten().tolist())
-            
-            if "現金" in bs_combined or "預金" in bs_combined:
-                results.append({
-                    "message": "貸借対照表は正常です。分析を開始します",
-                    "color": "green",
-                    "success": True
-                })
-            else:
-                results.append({
-                    "message": "貸借対照表には少なくとも、「現金」「普通預金」「当座預金」「定期預金」のいずれかが含まれている必要があります",
-                    "color": "red",
-                    "success": False
-                })
-                return results
+            json_str = response_json.strip()
+            if json_str.startswith("```"):
+                json_str = re.sub(r'^```(?:json)?\n?|\n?```$', '', json_str, flags=re.MULTILINE)
+            mapping_data = json.loads(json_str)
         except Exception as e:
-            results.append({
-                "message": f"貸借対照表のチェック中にエラーが発生しました: {str(e)}",
-                "color": "red",
-                "success": False
-            })
-            return results
-
-    return results
-
-def _extract_bs_data(file_bs: io.BytesIO) -> pd.DataFrame:
-    """
-    貸借対照表から期末残高を2次元検索で抽出する。
-    """
-    try:
-        file_bs.seek(0)
-        df_bs = None
-        for enc in ['utf-8-sig', 'cp932', 'utf-8', 'shift_jis']:
-            try:
-                file_bs.seek(0)
-                df_bs = pd.read_csv(file_bs, header=None, encoding=enc)
-                break
-            except:
-                continue
-
-        if df_bs is None:
-            return pd.DataFrame()
-
-        # 1-3行目から「期末」が含まれる列を特定（一番右を優先）
-        target_col_idx = -1
-        for r in range(min(3, len(df_bs))):
-            row_data = df_bs.iloc[r]
-            for c_idx, val in enumerate(row_data):
-                if "期末" in str(val):
-                    target_col_idx = max(target_col_idx, c_idx)
+            return None, f"JSON解析エラー: {str(e)}"
         
-        if target_col_idx == -1:
-            return pd.DataFrame()
+        mapping = mapping_data.get("column_mapping", {})
+        start_row = mapping_data.get("data_start_row", 0)
 
-        # 1-3列目から勘定科目を特定
-        accounts = {
-            "期末現金": ["現金"],
-            "期末普通預金": ["普通預金"],
-            "期末当座預金": ["当座預金"],
-            "期末定期預金": ["定期預金"]
-        }
+        # 4. バリデーション
+        required_keys = ["date", "debit_account", "debit_amount", "credit_account", "credit_amount"]
+        missing_keys = [k for k in required_keys if mapping.get(k) is None]
+        if missing_keys:
+            return None, f"必須項目不足: {', '.join(missing_keys)}"
+
+        # 5. データ抽出 (Wide形式)
+        extracted_data = {}
+        for std_name in STANDARD_JOURNAL_COLUMNS:
+            col_idx = mapping.get(std_name)
+            if col_idx is not None and col_idx < len(df_raw.columns):
+                extracted_data[std_name] = df_raw.iloc[start_row:, col_idx].reset_index(drop=True)
+            else:
+                extracted_data[std_name] = pd.NA
+        df_wide = pd.DataFrame(extracted_data)
         
-        results = {}
-        for key, keywords in accounts.items():
-            value = 0
-            found = False
-            for r_idx in range(len(df_bs)):
-                # 1-3列目をチェック
-                for c_idx in range(min(3, len(df_bs.columns))):
-                    cell_val = str(df_bs.iloc[r_idx, c_idx])
-                    if any(kw in cell_val for kw in keywords):
-                        # 期末列の値を取得
-                        try:
-                            raw_val = str(df_bs.iloc[r_idx, target_col_idx]).replace(',', '')
-                            import re
-                            # 数字以外の文字を除去（ただしマイナスは残す可能性を考慮しつつ基本は数値抽出）
-                            num_str = re.sub(r'[^\d.-]', '', raw_val)
-                            value = float(num_str) if num_str else 0
-                        except:
-                            value = 0
-                        found = True
+        # 6. クリーニング
+        def robust_parse_date(val):
+            if pd.isna(val) or str(val).strip() == "": return pd.NaT
+            s = str(val).strip()
+            s = s.translate(str.maketrans('０１２３４５６７８９．', '0123456789/'))
+            era_map = {"令和": 2018, "平成": 1988, "昭和": 1925}
+            for era, base_year in era_map.items():
+                if era in s:
+                    match = re.search(rf"{era}(\d+)年(\d+)月(\d+)日", s)
+                    if match:
+                        y, m, d = match.groups()
+                        s = f"{int(y) + base_year}/{m}/{d}"
                         break
-                if found: break
-            results[key] = value
+            try: return pd.to_datetime(s, errors='coerce')
+            except: return pd.NaT
 
-        # 合計の計算
-        results["期末現預金合計"] = sum([results["期末現金"], results["期末普通預金"], results["期末当座預金"], results["期末定期預金"]])
+        def clean_amount(val):
+            if pd.isna(val) or str(val).strip() == "": return 0.0
+            s = str(val).replace(',', '').replace('¥', '').replace('円', '').replace('△', '-').strip()
+            s = s.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+            cleaned = re.sub(r'[^\d.-]', '', s)
+            try: return float(cleaned) if cleaned else 0.0
+            except: return 0.0
+
+        # 型変換
+        df_wide["date"] = df_wide["date"].apply(robust_parse_date)
+        df_wide["created_at"] = df_wide["created_at"].apply(robust_parse_date)
+        df_wide["debit_amount"] = df_wide["debit_amount"].apply(clean_amount)
+        df_wide["credit_amount"] = df_wide["credit_amount"].apply(clean_amount)
+
+        def clean_partner(val):
+            if pd.isna(val) or str(val).strip() == "": return pd.NA
+            s = str(val)
+            
+            # 1. メタデータ的な塊を削除（依頼人名:以降の連続する文字列など）
+            s = re.sub(r"\(?依頼人名:\S*", "", s)
+            s = re.sub(r"振込予定日:\S*", "", s)
+            s = re.sub(r"管理番号:\S*", "", s)
+            
+            # 追加: X月分、令和X年X月分などの日付メタデータを削除
+            s = re.sub(r"(?:令和|平成|昭和)\d+年(?:度)?\d+月(?:分|度)?", "", s)
+            s = re.sub(r"年\d+月(?:分|度)?", "", s)
+            s = re.sub(r"\d+月(?:分|度)?", "", s)
+
+            # 追加: 業務関連の定型ワードを削除
+            biz_words = [
+                "業務委託費用", "業務委託費", "業務委託料", "業務委託",
+                "コンサルティング報酬", "コンサルティング費用", "コンサルティング手数料", "コンサルティング料", "コンサルティング", "コンサルタント料",
+                "アドバイザリー費用", "インスタグラム運用代行", "運用代行",
+                "初期費用", "月額費用", "共同事業分", "年契約", "経営パートナー契約",
+                "稼働料金", "コスト削減", "採用戦略", "経営", "返金？", "作成", "代行"
+            ]
+            for w in biz_words:
+                s = s.replace(w, "")
+                
+            # 2. 定型ノイズワードを削除（完全一致部分のみ）
+            noise_words = [
+                "他行振込手数料", "振込手数料", "手数料", "他行振込", "組戻手数料", "現金売上", "現金仕入",
+                "消費税", "普通預金", "当座預金", "普通", "当座", "法人立ち上げ"
+            ]
+            for w in noise_words:
+                s = s.replace(w, "")
+                
+            # 3. 銀行・支店・長い数字（口座番号）などを削除
+            s = re.sub(r"\S*銀行", "", s)
+            s = re.sub(r"\S*信用金庫", "", s)
+            s = re.sub(r"\S*信用組合", "", s)
+            s = re.sub(r"\S*支店", "", s)
+            s = re.sub(r"\d{4,}", "", s) # 4桁以上の数字
+            
+            # 4. 全てのスペースを削除（名寄せのため）
+            s = s.replace(" ", "").replace("　", "")
+            
+            # 5. 先頭や末尾に取り残された孤立したカッコなどの除去
+            s = re.sub(r"^[(\[【]+|[)\]】]+$", "", s)
+            
+            s = s.strip()
+            return s if s else pd.NA
+
+        if "partner" in df_wide.columns:
+            df_wide["partner"] = df_wide["partner"].apply(clean_partner)
+
+        # 日付前方埋め
+        df_wide["date"] = df_wide["date"].ffill()
         
-        return pd.DataFrame([results])
+        # デバッグ表示
+        print("--- DEBUG: Extracted Samples (Wide Format) ---")
+        for col in df_wide.columns:
+            print(f"DEBUG: {col}: {df_wide[col].head(5).tolist()}")
+
+        # 有効行フィルタ
+        df_wide = df_wide[df_wide["date"].notna() & (df_wide["debit_account"].notna() | df_wide["credit_account"].notna())]
+        
+        if df_wide.empty:
+            return None, "有効データなし"
+
+        print(f"--- DEBUG: ファイル{file_num}枚目から、{len(df_wide)}件の取引データを抽出しました ---")
+
+        # 8. 期間確認
+        df_wide = df_wide.sort_values("date")
+        min_date = df_wide["date"].min()
+        max_date = df_wide["date"].max()
+        months = (max_date.year - min_date.year) * 12 + (max_date.month - min_date.month) + 1
+        if months > 36:
+            return None, f"このファイル単体で期間が長すぎます（{months}ヶ月）。"
+
+        return df_wide, None
 
     except Exception as e:
-        print(f"BS extraction error: {e}")
-        return pd.DataFrame()
+        return None, f"SAD内部エラー: {str(e)}"
 
-def standardize_logic(file_journal: io.BytesIO, file_ledger: Optional[io.BytesIO] = None, 
-                      file_bs: Optional[io.BytesIO] = None, file_pl: Optional[io.BytesIO] = None) -> Dict[str, pd.DataFrame]:
+def process_bs_single(file: io.BytesIO) -> Tuple[Optional[Dict], Optional[str]]:
     """
-    アップロードされたファイルを読み込み、標準化されたDataFrameの辞書を返す。
+    1枚の貸借対照表ファイルを処理する。
     """
-    # 1. ヘッダー行の自動判定と読み込み
-    df_j = None
-    for enc in ['utf-8-sig', 'cp932', 'utf-8', 'shift_jis']:
+    try:
+        print("--- DEBUG: Starting B/S Processing ---")
+        df_raw = load_file_to_df(file)
+        if df_raw.empty:
+            return None, "ファイルが空です。"
+
+        # 全情報をCSV化して渡す
+        csv_text = df_raw.to_csv(index=False)
+
+        prompt = f"""
+あなたはプロの財務アナリストです。
+提供された貸借対照表（B/S）の全データから、以下の2つの情報を読み取って抽出してください。
+
+1. この貸借対照表における、期末の年月（YYYY/MM 形式の文字列で。例: 2024/09）
+2. この貸借対照表における、現預金の合計金額（数値で）
+
+貸借対照表データ：
+{csv_text}
+"""
+        response_json = exe_gemini_structure_forBS(prompt)
+        
         try:
-            skip_rows = _find_header_row(file_journal, enc)
-            file_journal.seek(0)
-            df_j = pd.read_csv(file_journal, encoding=enc, skiprows=skip_rows)
-            
-            # 正常に読み込めたか、最低限の項目チェック
-            mapped_temp = _map_headers(df_j)
-            if "date" in mapped_temp.columns and ("debit_amount" in mapped_temp.columns or "credit_amount" in mapped_temp.columns):
-                break # 成功
-            else:
-                # 判定に失敗した場合はskiprows=0で再試行してみる
-                file_journal.seek(0)
-                df_j = pd.read_csv(file_journal, encoding=enc)
-                mapped_temp = _map_headers(df_j)
-                if "date" in mapped_temp.columns:
-                    break
+            json_str = response_json.strip()
+            if json_str.startswith("```"):
+                json_str = re.sub(r'^```(?:json)?\n?|\n?```$', '', json_str, flags=re.MULTILINE)
+            result = json.loads(json_str)
         except Exception as e:
-            print(f"Read error with {enc}: {e}")
-            continue
+            return None, f"JSON解析エラー: {str(e)}"
 
-    if df_j is None or df_j.empty:
-        raise ValueError("仕訳帳の読み込みに失敗しました。ファイルが空か、対応していない形式です。")
-    
-    # 2. ヘッダーの名寄せ
-    df_j = _map_headers(df_j)
-    
-    # 3. 必要項目の抽出
-    # マッピング結果から存在するカラムのみ、さらに指定の名称に統一
-    final_j_cols = {}
-    for std_name in STANDARD_JOURNAL_COLUMNS:
-        if std_name in df_j.columns:
-            final_j_cols[std_name] = df_j[std_name]
-        else:
-            final_j_cols[std_name] = pd.NA
-            
-    df_journal_std = pd.DataFrame(final_j_cols)
+        ym = result.get("year_month")
+        cash = result.get("cash_amount")
 
-    # 4. 貸借対照表の処理
-    df_bs_std = pd.DataFrame()
-    if file_bs:
-        df_bs_std = _extract_bs_data(file_bs)
-    
-    return {
-        "journal": df_journal_std,
-        "bs": df_bs_std
-    }
+        if ym is None or cash is None:
+            return None, "期末の年月、または現預金の合計金額を取得できませんでした。"
+        
+        # ymが正しい形式か確認
+        if not re.match(r"^\d{4}/\d{2}$", str(ym)):
+            # geminiが推測したフォーマットが崩れている場合
+            pass
+
+        return {"year_month": str(ym), "cash_amount": cash}, None
+
+    except Exception as e:
+        return None, f"SAD(BS)内部エラー: {str(e)}"
+
+def check_accounting_files(file_journal1: io.BytesIO, file_bs: Optional[io.BytesIO] = None, 
+                           file_journal2: Optional[io.BytesIO] = None) -> List[Dict]:
+    return [{"message": "OK", "color": "green", "success": True}]
+
+def standardize_logic(file_journal1: io.BytesIO, file_journal2: Optional[io.BytesIO] = None, 
+                      file_bs: Optional[io.BytesIO] = None) -> Dict[str, pd.DataFrame]:
+    # 互換性維持
+    df1, _ = process_journal_single(file_journal1)
+    return {"journal": df1, "bs": pd.DataFrame()}
 
 if __name__ == "__main__":
-    # テスト用
     print("Standardization logic module loaded.")

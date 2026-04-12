@@ -116,24 +116,41 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> pd.DataFr
                        df_j['credit_account'].apply(lambda x: is_match(x, ar_patterns))
         
         def calc_ar_days(target_df):
-            sales = target_df.apply(lambda r: (r['credit_amount'] if pd.notna(r['credit_amount']) else 0) if is_match(r['credit_account'], sales_patterns) else 0, axis=1).sum()
-            ar_debits = target_df.apply(lambda r: (r['debit_amount'] if pd.notna(r['debit_amount']) else 0) if is_match(r['debit_account'], ar_patterns) else 0, axis=1).sum()
-            return (ar_debits / sales * 365) if sales > 0 else 0
+            # 期首残高など、開始時の異常に大きな一括投入を除外
+            valid_df = target_df[~target_df['partner'].astype(str).str.contains('期首|開始|繰越', na=False)]
+            sales = valid_df.apply(lambda r: (r['credit_amount'] if pd.notna(r['credit_amount']) else 0) if is_match(r['credit_account'], sales_patterns) else 0, axis=1).sum()
+            ar_debits = valid_df.apply(lambda r: (r['debit_amount'] if pd.notna(r['debit_amount']) else 0) if is_match(r['debit_account'], ar_patterns) else 0, axis=1).sum()
+            
+            # 売上が小さすぎる場合（月数日のデータなど）の計算爆発を防ぐ
+            if sales <= 1000:
+                return 0
+            
+            days = (ar_debits / sales * 365)
+            # ガード: 極端な異常値(999日を超えるなど)は切り捨てるか丸める
+            return min(days, 999.0)
 
         ar_days_curr = calc_ar_days(df_curr)
         ar_days_prev = calc_ar_days(df_prev)
-        diff = ar_days_curr - ar_days_prev
-
-        results.append(["② 会計品質", "入金サイト延伸", f"{diff:+.1f}日", f"回収期間が前年比で{diff:+.1f}日変動しています", "red" if diff >= 5 else "blue"])
+        
+        if ar_days_curr == 0 and ar_days_prev == 0:
+            results.append(["② 会計品質", "入金サイト延伸", "なし", "比較可能な有意義な売上データが不足しているため判定できません", "grey"])
+        else:
+            diff = ar_days_curr - ar_days_prev
+            if abs(diff) >= 365:
+                results.append(["② 会計品質", "入金サイト延伸", "なし", "存在しない、または解析エラーです", "grey"])
+            else:
+                results.append(["② 会計品質", "入金サイト延伸", f"{diff:+.1f}日", f"回収期間が前年比で{diff:+.1f}日変動しています", "red" if diff >= 5 else "blue"])
     else:
         results.append(["② 会計品質", "入金サイト延伸", "なし", "データが12ヶ月分のみのため判定できません", "grey"])
 
     # --- 3. 売上構造 ---
     # 3.1 新規取引先数
-    if months_count >= 13 and not df_prev.empty:
-        # 取引先列が credit_partner 側にある前提（売上行）
-        partners_curr = set(df_curr[df_curr['is_sales']]['credit_partner'].dropna())
-        partners_prev = set(df_prev[df_prev['is_sales']]['credit_partner'].dropna())
+    if 'partner' not in df_j.columns or df_j['partner'].isna().all():
+        results.append(["③ 売上構造", "新規取引先数", "なし", "取引先データが抽出できなかったため判定できません", "grey"])
+    elif months_count >= 13 and not df_prev.empty:
+        # 取引先列が partner 側にある前提（売上行）
+        partners_curr = set(df_curr[df_curr['is_sales']]['partner'].dropna())
+        partners_prev = set(df_prev[df_prev['is_sales']]['partner'].dropna())
         new_partners = partners_curr - partners_prev
         new_partner_count = len(new_partners)
         
@@ -142,10 +159,12 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> pd.DataFr
         results.append(["③ 売上構造", "新規取引先数", "なし", "比較対象となる昨年のデータがないため判定できません", "grey"])
 
     # 3.2 新規継続率
-    if months_count >= 13 and 'new_partners' in locals() and len(new_partners) > 0:
+    if 'partner' not in df_j.columns or df_j['partner'].isna().all():
+        results.append(["③ 売上構造", "新規継続率", "なし", "取引先データが抽出できなかったため判定できません", "grey"])
+    elif months_count >= 13 and 'new_partners' in locals() and len(new_partners) > 0:
         retain_count = 0
         for p in new_partners:
-            p_rows = df_curr[df_curr['credit_partner'] == p].sort_values('date')
+            p_rows = df_curr[df_curr['partner'] == p].sort_values('date')
             if len(p_rows) > 1:
                 first_date = p_rows.iloc[0]['date']
                 second_date = p_rows.iloc[1]['date']
@@ -155,7 +174,7 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> pd.DataFr
         retention_rate = (retain_count / len(new_partners)) * 100
         results.append(["③ 売上構造", "新規継続率", f"{retention_rate:.1f}%", f"新規取引先のうち{retention_rate:.1f}%が3ヶ月以内に再取引しています", "red" if retention_rate < 20 else "blue"])
     else:
-        results.append(["③ 売上構造", "新規継続率", "なし", "新規取引先がいない、または12ヶ月分のみのため判定できません", "grey"])
+        results.append(["③ 売上構造", "新規継続率", "なし", "新規取引先がいない、または判定材料が不足しているため判定できません", "grey"])
 
     # 3.3 粗利率トレンド
     if len(monthly_stats) >= 3:
@@ -166,8 +185,8 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> pd.DataFr
         results.append(["③ 売上構造", "粗利率トレンド", "なし", "データが3ヶ月分に満たないため判定できません", "grey"])
 
     # 3.4 上位3社売上集中度
-    sales_by_partner = df_j[df_j['is_sales']].groupby('credit_partner')['sales_amt'].sum().sort_values(ascending=False)
-    if not sales_by_partner.empty:
+    sales_by_partner = df_j[df_j['is_sales']].groupby('partner')['sales_amt'].sum().sort_values(ascending=False)
+    if not sales_by_partner.empty and sales_by_partner.sum() > 0:
         top3_share = (sales_by_partner.head(3).sum() / sales_by_partner.sum()) * 100
         results.append(["③ 売上構造", "上位3社売上集中度", f"{top3_share:.1f}%", f"上位3社への売上集中度が{top3_share:.1f}%です", "red" if top3_share >= 70 else "blue"])
     else:
@@ -175,8 +194,8 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> pd.DataFr
 
     # --- 4. 仕入コスト ---
     # 4.1 上位3社仕入集中度
-    cogs_by_partner = df_j[df_j['is_cogs']].groupby('debit_partner')['cogs_amt'].sum().sort_values(ascending=False)
-    if not cogs_by_partner.empty:
+    cogs_by_partner = df_j[df_j['is_cogs']].groupby('partner')['cogs_amt'].sum().sort_values(ascending=False)
+    if not cogs_by_partner.empty and cogs_by_partner.sum() > 0:
         top3_cogs_share = (cogs_by_partner.head(3).sum() / cogs_by_partner.sum()) * 100
         results.append(["④ 仕入コスト", "上位3社仕入集中度", f"{top3_cogs_share:.1f}%", f"上位3社への仕入集中度が{top3_cogs_share:.1f}%です", "red" if top3_cogs_share >= 70 else "blue"])
     else:

@@ -64,84 +64,254 @@ def show_main():
     st.markdown("あなたの12～24か月の会計データから、診断レポートと営業先リストを作成いたします")
 
     # 3. メインアクションエリア (PC向けに中央に寄せる)
-    _, col_center, _ = st.columns([1, 2, 1])
+    _, col_center, _ = st.columns([0.5, 4, 0.5])
 
     with col_center:
+        st.markdown("### 【任意】会社情報の入力")
+        st.markdown("営業先候補リスト・仕入先候補リストの精度を高めたい場合は、以下会社情報を入力してください")
+        st.text_input("会社名", key="company_name")
+        st.text_input("会社の業種", key="company_industry")
+        st.markdown("<br>", unsafe_allow_html=True)
+        
         st.markdown("### 会計データのアップロード")
-        st.markdown("※仕訳帳・貸借対照表における項目名は、かならず1行目に配置してください")
+        st.markdown("※csvまたはxlsxファイルのみ受け付けます。xlsxファイルは1つ目のシートのみ読み込みます")
         st.markdown("※貸借対照表をアップロードする場合は、「仕訳帳の最終月」と「貸借対照表の期末月」を合わせてください")
         st.markdown("※アップロードされた会計データは、診断後すぐに破棄されますのでご安心ください")
         
-        # 2つのアップロード枠
-        file_journal = st.file_uploader("① 仕訳帳（CSV） 【必須】", type=["csv"], help="必須項目です。")
-        if file_journal:
-            st.success("✅ 仕訳帳が読み込まれました。")
-            
-        file_bs = st.file_uploader("② 貸借対照表（CSV） 【任意】", type=["csv"])
+        # --- 非同期処理用のヘルパー関数 ---
+        import threading
+        import importlib
+        from streamlit.runtime.scriptrunner import add_script_run_ctx
+        
+        # 数字から始まるモジュールは直接importできないためimportlibを使用
+        SAD_module = importlib.import_module("process.1_standardizeAccountingData")
+        process_journal_single = SAD_module.process_journal_single
+        process_bs_single = SAD_module.process_bs_single
+
+        def start_async_process(file, key_prefix):
+            def task():
+                try:
+                    file_num = 1 if key_prefix == "j1" else 2
+                    df, error = process_journal_single(file, file_num=file_num)
+                    if error:
+                        st.session_state[f"{key_prefix}_error"] = error
+                        st.session_state[f"{key_prefix}_status"] = "error"
+                        return
+
+                    # --- 期間バリデーション ---
+                    min_d = df["date"].min()
+                    max_d = df["date"].max()
+                    months = (max_d.year - min_d.year) * 12 + (max_d.month - min_d.month) + 1
+
+                    if key_prefix == "j2":
+                        # 2枚目の場合：1枚目(J1)との統合期間をチェック
+                        if st.session_state.get("j1_status") == "success":
+                            df1 = st.session_state["j1_data"]
+                            j1_start = df1["date"].min()
+                            j2_end = max_d
+                            total_months = (j2_end.year - j1_start.year) * 12 + (j2_end.month - j1_start.month) + 1
+                            
+                            if not (12 <= total_months <= 24):
+                                st.session_state[f"{key_prefix}_error"] = f"2ファイルの合計期間が不適切です（{total_months}ヶ月分。12〜24ヶ月にする必要があります）"
+                                st.session_state[f"{key_prefix}_status"] = "error"
+                                return
+                            st.session_state["total_months_msg"] = f"✅ 2ファイル合計で {total_months}ヶ月分を確認しました"
+                        else:
+                            # J1がない状態でJ2が上がった場合
+                            st.session_state[f"{key_prefix}_error"] = "先に1枚目の仕訳帳をアップロードしてください。"
+                            st.session_state[f"{key_prefix}_status"] = "error"
+                            return
+                    else:
+                        # 1枚目(J1)単体の場合
+                        if months > 24:
+                                st.session_state[f"{key_prefix}_error"] = f"仕訳帳1枚の期間が長すぎます（{months}ヶ月分）。"
+                                st.session_state[f"{key_prefix}_status"] = "error"
+                                return
+
+                    # 全てOKなら保存
+                    st.session_state[f"{key_prefix}_data"] = df
+                    st.session_state[f"{key_prefix}_status"] = "success"
+                    st.session_state[f"{key_prefix}_error"] = None
+
+                except Exception as e:
+                    st.session_state[f"{key_prefix}_error"] = f"システムエラー: {str(e)}"
+                    st.session_state[f"{key_prefix}_status"] = "error"
+
+            st.session_state[f"{key_prefix}_status"] = "processing"
+            st.session_state[f"{key_prefix}_error"] = None
+            st.session_state[f"{key_prefix}_file_id"] = f"{file.name}_{file.size}"
+            thread = threading.Thread(target=task)
+            add_script_run_ctx(thread)
+            thread.start()
+
+        def start_async_process_bs(file, key_prefix):
+            def task():
+                try:
+                    data, error = process_bs_single(file)
+                    if error:
+                        st.session_state[f"{key_prefix}_error"] = error
+                        st.session_state[f"{key_prefix}_status"] = "error"
+                        return
+                    
+                    st.session_state[f"{key_prefix}_data"] = data
+                    st.session_state[f"{key_prefix}_status"] = "success"
+                    st.session_state[f"{key_prefix}_error"] = None
+
+                except Exception as e:
+                    st.session_state[f"{key_prefix}_error"] = f"システムエラー: {str(e)}"
+                    st.session_state[f"{key_prefix}_status"] = "error"
+
+            st.session_state[f"{key_prefix}_status"] = "processing"
+            st.session_state[f"{key_prefix}_error"] = None
+            st.session_state[f"{key_prefix}_file_id"] = f"{file.name}_{file.size}"
+            thread = threading.Thread(target=task)
+            add_script_run_ctx(thread)
+            thread.start()
+
+        @st.fragment(run_every="5s")
+        def show_file_status(key_prefix, name):
+            status = st.session_state.get(f"{key_prefix}_status", "idle")
+            if status == "processing":
+                st.info(f"⏳ {name} を解析中...（最大30秒程度かかります）")
+            elif status == "error":
+                st.error(f"❌ {st.session_state.get(f'{key_prefix}_error')}")
+            elif status == "success":
+                # J2の場合は統合期間メッセージを表示
+                msg = "解析が完了しました"
+                if key_prefix == "j2" and st.session_state.get("total_months_msg"):
+                    st.success(st.session_state["total_months_msg"])
+                else:
+                    st.success(f"✅ {name} の{msg}")
+
+        # 3つのアップロード枠
+        # --- 仕訳帳 1 ---
+        file_journal1 = st.file_uploader("① 仕訳帳（1期目または2期分） 【必須】", type=["csv", "xlsx"], help="必須項目です。")
+        if file_journal1:
+            fid = f"{file_journal1.name}_{file_journal1.size}"
+            if st.session_state.get("j1_file_id") != fid:
+                start_async_process(file_journal1, "j1")
+            show_file_status("j1", "仕訳帳（1つ目）")
+        else:
+            # ファイルが削除された場合は状態をリセット
+            st.session_state["j1_file_id"] = None
+            st.session_state["j1_status"] = "idle"
+            st.session_state["j1_data"] = None
+            st.session_state["j1_error"] = None
+
+        # --- 仕訳帳 2 ---
+        file_journal2 = st.file_uploader("② 仕訳帳（2期目） 【任意】", type=["csv", "xlsx"], help="ファイルが分かれている場合はこちらもアップロードしてください。")
+        if file_journal2:
+            fid2 = f"{file_journal2.name}_{file_journal2.size}"
+            if st.session_state.get("j2_file_id") != fid2:
+                start_async_process(file_journal2, "j2")
+            show_file_status("j2", "仕訳帳（2つ目）")
+        else:
+            st.session_state["j2_file_id"] = None
+            st.session_state["j2_status"] = "idle"
+            st.session_state["j2_data"] = None
+            st.session_state["j2_error"] = None
+            st.session_state["total_months_msg"] = None
+
+        # --- 貸借対照表 ---
+        file_bs = st.file_uploader("③ 貸借対照表 【任意】", type=["csv", "xlsx"])
         if file_bs:
-            st.success("✅ 貸借対照表が読み込まれました。")
+            fid_bs = f"{file_bs.name}_{file_bs.size}"
+            if st.session_state.get("bs_file_id") != fid_bs:
+                start_async_process_bs(file_bs, "bs")
+            show_file_status("bs", "貸借対照表")
+        else:
+            st.session_state["bs_file_id"] = None
+            st.session_state["bs_status"] = "idle"
+            st.session_state["bs_data"] = None
+            st.session_state["bs_error"] = None
         
         st.markdown("<br>", unsafe_allow_html=True)
         
         # 4. 作成ボタン
         if st.button("診断レポートと営業先リストを作成", use_container_width=True):
-            if not file_journal:
-                st.error("❌ 最低でも「仕訳帳」のアップロードが必要です。")
+            if not file_journal1:
+                st.error("❌ 最低でも「仕訳帳（1つ目）」のアップロードが必要です。")
+            elif st.session_state.get("j1_status") == "processing":
+                st.warning("⚠️ 仕訳帳（1つ目）の解析がまだ完了していません。あと数秒お待ちください。")
+            elif st.session_state.get("j1_status") == "error":
+                st.error("❌ 仕訳帳（1つ目）にエラーがあるため、進めません。")
+            elif st.session_state.get("bs_status") == "processing":
+                st.warning("⚠️ 貸借対照表の解析がまだ完了していません。あと数秒お待ちください。")
+            elif st.session_state.get("bs_status") == "error":
+                st.error(f"❌ 貸借対照表の解析エラー: {st.session_state.get('bs_error')}")
             else:
-                st.session_state["is_processed"] = True
-                st.success("解析を開始します。しばらくお待ちください...")
-                
-                # 処理エンジンの呼び出し
-                process_logic = importlib.import_module("process.1_standardizeAccountingData")
-                standardize_logic = process_logic.standardize_logic
-                check_accounting_files = process_logic.check_accounting_files
-                
-                try:
-                    # 1. バリデーションチェック
-                    validation_results = check_accounting_files(file_journal, file_bs)
+                # BSのバリデーション
+                bs_invalid = False
+                if file_bs and st.session_state.get("bs_status") == "success":
+                    bs_data = st.session_state.get("bs_data")
+                    journal_max_date = None
+                    if st.session_state.get("j2_status") == "success":
+                        journal_max_date = st.session_state["j2_data"]["date"].max()
+                    elif st.session_state.get("j1_status") == "success":
+                        journal_max_date = st.session_state["j1_data"]["date"].max()
                     
-                    is_all_ok = True
-                    for res in validation_results:
-                        if res["color"] == "green":
-                            st.success(f"✅ {res['message']}")
-                        elif res["color"] == "red":
-                            st.error(f"❌ {res['message']}")
-                            is_all_ok = False
-                        else:
-                            st.info(res['message'])
-                    
-                    if not is_all_ok:
-                        st.stop() # 処理をストップ
+                    if journal_max_date is not None and bs_data and bs_data.get("year_month"):
+                        try:
+                            bs_ym = datetime.strptime(bs_data["year_month"], "%Y/%m")
+                            j_year = journal_max_date.year
+                            j_month = journal_max_date.month
+                            b_year = bs_ym.year
+                            b_month = bs_ym.month
+                            
+                            month_diff = abs((j_year - b_year) * 12 + (j_month - b_month))
+                            print(f"--- DEBUG: Month Diff: J: {j_year}/{j_month}, B: {b_year}/{b_month}, Diff: {month_diff} ---")
+                            
+                            if month_diff > 3:
+                                st.error(f"❌ 「仕訳帳の最後の取引年月({j_year}/{j_month})」と「貸借対照表の期末年月({b_year}/{b_month})」が3ヶ月を超えて離れています。（差: {month_diff}ヶ月）")
+                                bs_invalid = True
+                        except Exception as e:
+                            print(f"Date Parse debug Error: {e}")
+                            st.error("❌ 貸借対照表の期末年月フォーマットが不正です。")
+                            bs_invalid = True
 
-                    # 2. 標準化処理（仕訳帳は必須）
-                    std_data = standardize_logic(
-                        file_journal=file_journal,
-                        file_bs=file_bs
-                    )
-                    
-                    # 3. 診断レポートの作成
-                    report_mod = importlib.import_module("process.2_createDiagnosticReportPdf")
-                    report_data = report_mod.create_diagnostic_report(
-                        df_journal=std_data["journal"],
-                        df_bs=std_data["bs"]
-                    )
-                    
-                    # セッション状態に保存
-                    st.session_state["standardized_journal"] = std_data["journal"]
-                    st.session_state["standardized_bs"] = std_data["bs"]
-                    st.session_state["report_pdf_bytes"] = report_data["pdf_bytes"]
-                    st.session_state["report_preview_md"] = report_data["preview_md"]
-                    st.session_state["report_analysis_df"] = report_data["analysis_df"]
-                    
-                    # フラグ管理
-                    st.session_state["report_ready"] = True
-                    st.session_state["biz_list_ready"] = False # まだ
-                    st.session_state["supplier_list_ready"] = False # まだ
+                if not bs_invalid:
                     st.session_state["is_processed"] = True
-                    st.rerun() # 画面を更新してプレビューを表示
+                    st.success("解析を開始します。しばらくお待ちください...")
                     
-                except Exception as e:
-                    st.error(f"❌ 処理中にエラーが発生しました: {e}")
+                    try:
+                        # 1. データの準備
+                        std_data = {
+                            "journal": st.session_state.get("j1_data"),
+                            "bs": pd.DataFrame() # BSは一旦空フレーム
+                        }
+                        # もしBSデータがあれば組み込む(後続処理用)
+                        if file_bs and st.session_state.get("bs_status") == "success":
+                            bs_d = st.session_state.get("bs_data")
+                            if bs_d and bs_d.get("cash_amount") is not None:
+                                std_data["bs"] = pd.DataFrame({"期末現預金合計": [bs_d.get("cash_amount")]})
+
+                        if st.session_state.get("j2_status") == "success":
+                            st.info("2つの仕訳帳を結合しています...")
+                            std_data["journal"] = pd.concat([std_data["journal"], st.session_state.get("j2_data")]).sort_values("date")
+                        
+                        # 2. 診断レポートの作成
+                        report_mod = importlib.import_module("process.2_createDiagnosticReportPdf")
+                        report_data = report_mod.create_diagnostic_report(
+                            df_journal=std_data["journal"],
+                            df_bs=std_data["bs"]
+                        )
+                        
+                        # セッション状態に保存
+                        st.session_state["standardized_journal"] = std_data["journal"]
+                        st.session_state["standardized_bs"] = std_data["bs"]
+                        st.session_state["report_pdf_bytes"] = report_data["pdf_bytes"]
+                        st.session_state["report_preview_md"] = report_data["preview_md"]
+                        st.session_state["report_analysis_df"] = report_data["analysis_df"]
+                        
+                        # フラグ管理
+                        st.session_state["report_ready"] = True
+                        st.session_state["biz_list_ready"] = False
+                        st.session_state["supplier_list_ready"] = False
+                        st.session_state["is_processed"] = True
+                        st.rerun()
+                        
+                    except Exception as e:
+                        st.error(f"❌ 処理中にエラーが発生しました: {e}")
 
     # 5. 処理後のUI（ボタン押下後のみ表示）
     if st.session_state.get("is_processed", False):

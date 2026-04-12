@@ -23,9 +23,10 @@ def _create_list_common(df_journal: pd.DataFrame, row_idx: int, col_idx: int, ta
     partners = set()
     # 借方・貸方のいずれかに指定科目が含まれる場合、その行の取引先を取得
     mask_debit = df_journal["debit_account"].fillna("").str.contains("|".join(target_accounts))
-    partners.update(df_journal[mask_debit]["debit_partner"].dropna().unique())
     mask_credit = df_journal["credit_account"].fillna("").str.contains("|".join(target_accounts))
-    partners.update(df_journal[mask_credit]["credit_partner"].dropna().unique())
+    mask_target = mask_debit | mask_credit
+    if "partner" in df_journal.columns:
+        partners.update(df_journal[mask_target]["partner"].dropna().unique())
     
     partners = {str(p) for p in partners if pd.notna(p) and str(p).strip() != ""}
     partner_list_str = "\n".join(sorted(list(partners)))
@@ -44,10 +45,24 @@ def _create_list_common(df_journal: pd.DataFrame, row_idx: int, col_idx: int, ta
         base_prompt = f"以下の取引先一覧から、今後の{fallback_name}候補を提案してください。"
 
     # 3. プロンプト結合
-    full_prompt = f"{base_prompt}\n\n【既存取引先一覧】\n{partner_list_str}"
+    company_name = st.session_state.get("company_name", "").strip() or "未入力"
+    company_industry = st.session_state.get("company_industry", "").strip() or "未入力"
+
+    full_prompt = (
+        f"{base_prompt}\n\n"
+        f"# ユーザーの会社名（ユーザー入力）\n{company_name}\n\n"
+        f"# 上記ユーザーの会社の業種（ユーザー入力）\n{company_industry}\n\n"
+        f"# この会社の既存取引先リスト\n{partner_list_str}"
+    )
     
+    print(f"\n--- DEBUG: {fallback_name}生成用 Geminiプロンプト ---")
+    print(full_prompt)
+    print("--------------------------------------------------")
+    print(f"--- DEBUG: {fallback_name}生成のため Gemini API へリクエスト中... ---")
+
     # 4. Gemini呼び出し
     structured_json_str = exe_gemini_withGoogleSearch_and_structure(full_prompt)
+    print(f"--- DEBUG: {fallback_name}リスト Gemini API 取得完了 ---")
     
     # 5. DataFrame化
     try:
