@@ -301,6 +301,7 @@ def show_main():
                         st.session_state["report_pdf_bytes"] = report_data["pdf_bytes"]
                         st.session_state["report_preview_md"] = report_data["preview_md"]
                         st.session_state["report_analysis_df"] = report_data["analysis_df"]
+                        st.session_state["report_excel_bytes"] = report_data["excel_bytes"]
                         
                         # フラグ管理
                         st.session_state["report_ready"] = True
@@ -350,10 +351,11 @@ def show_main():
             st.markdown("<br>", unsafe_allow_html=True)
 
             # ④ 指定された3項目のみを抽出
-            # 赤項目を優先し、合計3項目を抽出
+            # 赤は最優先、黄色があれば次に優先、それ以降は元々の順番通りに抽出
             red_rows = analysis_df[analysis_df["color"] == "red"]
-            other_rows = analysis_df[analysis_df["color"] != "red"]
-            preview_df = pd.concat([red_rows, other_rows]).head(3).copy()
+            yellow_rows = analysis_df[analysis_df["color"] == "yellow"]
+            other_rows = analysis_df[~analysis_df["color"].isin(["red", "yellow"])]
+            preview_df = pd.concat([red_rows, yellow_rows, other_rows]).head(3).copy()
             
             # --- 「問題の本質」の追加 ---
             preview_df["essence"] = preview_df["item"].map(ESSENCE_MAP)
@@ -363,6 +365,8 @@ def show_main():
                 color_key = row["color"]
                 if color_key == "red":
                     bg_color = "background-color: #ffeef0; color: #000000"
+                elif color_key == "yellow":
+                    bg_color = "background-color: #fff9db; color: #000000"
                 elif color_key == "blue":
                     bg_color = "background-color: #eef6ff; color: #000000"
                 elif color_key == "grey":
@@ -396,6 +400,16 @@ def show_main():
             data=st.session_state.get("report_pdf_bytes", b""),
             file_name=pdf_filename,
             mime="application/pdf",
+            use_container_width=True
+        )
+        
+        # 銀行説明用リスト(Excel) ダウンロードボタン
+        excel_filename = f"特命AI_銀行説明用リスト_{now_str}.xlsx"
+        st.download_button(
+            label="銀行説明用リスト(Excel)をダウンロード",
+            data=st.session_state.get("report_excel_bytes", b""),
+            file_name=excel_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
         

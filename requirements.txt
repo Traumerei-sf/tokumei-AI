@@ -1,5 +1,6 @@
 streamlit
 pandas
+numpy
 openpyxl
 st-gsheets-connection
 fpdf2>=2.7.8
