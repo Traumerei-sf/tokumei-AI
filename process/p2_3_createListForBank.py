@@ -281,8 +281,8 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                 grouped_pays = near_pays.groupby('pay_type').agg({
                     'debit_amount': 'sum',
                     'pay_priority': 'first',
-                    'debit_account': lambda x: ",".join(x.astype(str).unique()),
-                    'partner': lambda x: ",".join(x.dropna().astype(str).unique())
+                    'debit_account': lambda x: ",".join(map(str, x.astype(str).unique())),
+                    'partner': lambda x: ",".join(map(str, x.dropna().astype(str).unique()))
                 }).reset_index()
                 
                 grouped_pays['diff_pct'] = (grouped_pays['debit_amount'] - o_amt).abs() / o_amt
