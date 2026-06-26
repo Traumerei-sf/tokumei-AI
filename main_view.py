@@ -295,6 +295,11 @@ def show_main():
                             df_bs=std_data["bs"]
                         )
                         
+                        # ファイル名の決定
+                        now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                        pdf_filename = f"特命AI_診断レポート_{now_str}.pdf"
+                        excel_filename = f"特命AI_銀行説明用リスト_{now_str}.xlsx"
+                        
                         # セッション状態に保存
                         st.session_state["standardized_journal"] = std_data["journal"]
                         st.session_state["standardized_bs"] = std_data["bs"]
@@ -302,6 +307,28 @@ def show_main():
                         st.session_state["report_preview_md"] = report_data["preview_md"]
                         st.session_state["report_analysis_df"] = report_data["analysis_df"]
                         st.session_state["report_excel_bytes"] = report_data["excel_bytes"]
+                        st.session_state["pdf_filename"] = pdf_filename
+                        st.session_state["excel_filename"] = excel_filename
+                        
+                        # Google Driveへ自動アップロード
+                        try:
+                            from process.u_googleDrive import upload_pdf_to_drive, upload_file_to_drive
+                            # PDFのアップロード
+                            pdf_file_id = upload_pdf_to_drive(report_data["pdf_bytes"], pdf_filename)
+                            # Excelのアップロード
+                            excel_file_id = upload_file_to_drive(
+                                report_data["excel_bytes"],
+                                excel_filename,
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                            
+                            if pdf_file_id and excel_file_id:
+                                st.session_state["drive_upload_success"] = True
+                            else:
+                                st.session_state["drive_upload_success"] = False
+                        except Exception as e:
+                            print(f"Failed to import/execute Google Drive upload: {e}")
+                            st.session_state["drive_upload_success"] = False
                         
                         # フラグ管理
                         st.session_state["report_ready"] = True
@@ -341,12 +368,7 @@ def show_main():
             color = "red" if red_count > 0 else "black"
             st.markdown(f"<div style='text-align: center; color: {color};'><h3>{summary_msg}</h3></div>", unsafe_allow_html=True)
             
-            # ③ 画像の挿入 (中央揃え)
-            img_path = os.path.join("assets", "特命AI_レポート画像_1.jpeg")
-            if os.path.exists(img_path):
-                _, img_col, _ = st.columns([1, 3, 1])
-                with img_col:
-                    st.image(img_path, width=500)
+
             
             st.markdown("<br>", unsafe_allow_html=True)
 
@@ -392,8 +414,7 @@ def show_main():
             st.markdown(st.session_state.get("report_preview_md", "レポートを作成できませんでした。"))
         
         # 5.2 診断レポート ダウンロードボタン
-        now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        pdf_filename = f"特命AI_診断レポート_{now_str}.pdf"
+        pdf_filename = st.session_state.get("pdf_filename", f"特命AI_診断レポート_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pdf")
 
         st.download_button(
             label="診断レポート(PDF)をダウンロード",
@@ -404,7 +425,7 @@ def show_main():
         )
         
         # 銀行説明用リスト(Excel) ダウンロードボタン
-        excel_filename = f"特命AI_銀行説明用リスト_{now_str}.xlsx"
+        excel_filename = st.session_state.get("excel_filename", f"特命AI_銀行説明用リスト_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.xlsx")
         st.download_button(
             label="銀行説明用リスト(Excel)をダウンロード",
             data=st.session_state.get("report_excel_bytes", b""),

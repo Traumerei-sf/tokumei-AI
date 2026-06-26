@@ -113,105 +113,179 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
     else:
         results.append(["① 資金繰り", "預金体力推移", "なし", "貸借対照表がないため判定できません", "grey"])
 
-    # 1.3 税金・社会保険料 of 納付確認
-    # フィルター判定関数の定義
-    def is_gensen_credit(r):
-        is_acc = pd.notna(r['credit_account']) and "預り金" in str(r['credit_account'])
-        is_desc = pd.notna(r['partner']) and any(k in str(r['partner']) for k in ["源泉", "所得税", "給与"])
-        return is_acc and is_desc
+    # --- 1.3 税金・社会保険料の納付確認 ---
+    yokin_pat = "預金|現金|当座|普通|手形|電信"
 
-    def is_gensen_debit(r):
-        is_acc = pd.notna(r['debit_account']) and "預り金" in str(r['debit_account'])
-        is_desc = pd.notna(r['partner']) and any(k in str(r['partner']) for k in ["源泉", "所得税"])
-        return is_acc and is_desc
+    def is_yokin_account(acc):
+        return pd.notna(acc) and any(k in str(acc) for k in ["預金", "現金", "当座", "普通", "手形", "電信"])
 
-    def is_juumin_credit(r):
-        is_acc = pd.notna(r['credit_account']) and "預り金" in str(r['credit_account'])
-        is_desc = pd.notna(r['partner']) and any(k in str(r['partner']) for k in ["住民税", "特別徴収", "市県民税"])
-        return is_acc and is_desc
+    # キーワード定義
+    gensen_keywords = ["所得税", "源泉"]
+    juumin_keywords = ["住民税", "特別徴収", "市県民税"]
+    shaho_keywords = ["社会保険", "健康保険", "厚生年金"]
+    acc_targets = ["預り金", "法定福利費"]
 
-    def is_juumin_debit(r):
-        is_acc = pd.notna(r['debit_account']) and "預り金" in str(r['debit_account'])
-        is_desc = pd.notna(r['partner']) and any(k in str(r['partner']) for k in ["住民税", "特別徴収"])
-        return is_acc and is_desc
+    # 発生候補判定（貸方）
+    def is_candidate_credit(r, keywords, target_accs):
+        acc = r['credit_account']
+        if pd.isna(acc) or not any(k in str(acc) for k in target_accs):
+            return False
+        partner_val = r['partner']
+        c_partner_val = r['credit_partner'] if 'credit_partner' in r else pd.NA
+        
+        has_kw = False
+        if pd.notna(c_partner_val) and any(k in str(c_partner_val) for k in keywords):
+            has_kw = True
+        elif pd.notna(partner_val) and any(k in str(partner_val) for k in keywords):
+            has_kw = True
+        return has_kw
 
-    def is_shaho_credit(r):
-        is_acc = pd.notna(r['credit_account']) and any(k in str(r['credit_account']) for k in ["預り金", "法定福利費"])
-        is_desc = pd.notna(r['partner']) and any(k in str(r['partner']) for k in ["社会保険", "健康保険", "厚生年金", "年金"])
-        return is_acc and is_desc
+    # 納付候補判定（借方）
+    def is_candidate_debit(r, keywords, target_accs):
+        acc = r['debit_account']
+        if pd.isna(acc) or not any(k in str(acc) for k in target_accs):
+            return False
+        partner_val = r['partner']
+        d_partner_val = r['debit_partner'] if 'debit_partner' in r else pd.NA
+        
+        has_kw = False
+        if pd.notna(d_partner_val) and any(k in str(d_partner_val) for k in keywords):
+            has_kw = True
+        elif pd.notna(partner_val) and any(k in str(partner_val) for k in keywords):
+            has_kw = True
+        return has_kw
 
-    def is_shaho_debit(r):
-        is_acc = pd.notna(r['debit_account']) and any(k in str(r['debit_account']) for k in ["預り金", "法定福利費"])
-        is_desc = pd.notna(r['partner']) and any(k in str(r['partner']) for k in ["健康保険", "厚生年金", "日本年金機構", "社会保険"])
-        return is_acc and is_desc
+    # 確定した納付仕訳かどうかの判定
+    def confirm_pay_status(r, df_data, keywords, target_accs):
+        if not is_candidate_debit(r, keywords, target_accs):
+            return False
+        
+        # A: 貸方科目に預金等が含まれる場合
+        if is_yokin_account(r['credit_account']):
+            return True
+            
+        # B: 貸方科目に預金等が含まれない場合
+        tx_no = r['transaction_no']
+        
+        # B-0: 取引Noがnullの場合
+        if pd.isna(tx_no) or str(tx_no).strip() == "" or str(tx_no) == "<NA>":
+            return False
+            
+        # 同一取引Noの別仕訳を検索
+        same_tx_df = df_data[(df_data['transaction_no'] == tx_no) & (df_data.index != r.name)]
+        
+        # B-1: 別仕訳が存在しない場合
+        if same_tx_df.empty:
+            return False
+            
+        # B-2-2: 同取引Noの別仕訳の貸方に、預金等が含まれるか
+        has_yokin_credit = same_tx_df['credit_account'].apply(is_yokin_account).any()
+        if has_yokin_credit:
+            return True
+            
+        # B-2-1: 含まれない場合
+        return False
 
-    # 全期間で預り金系が全くないかチェック
-    has_gensen_any = df_curr.apply(is_gensen_credit, axis=1).any()
-    has_juumin_any = df_curr.apply(is_juumin_credit, axis=1).any()
-    has_shaho_any = df_curr.apply(is_shaho_credit, axis=1).any()
+    # 各仕訳の発生・納付フラグ付与
+    df_curr['is_gensen_pay'] = df_curr.apply(lambda r: confirm_pay_status(r, df_curr, gensen_keywords, acc_targets), axis=1)
+    df_curr['is_juumin_pay'] = df_curr.apply(lambda r: confirm_pay_status(r, df_curr, juumin_keywords, acc_targets), axis=1)
+    df_curr['is_shaho_pay'] = df_curr.apply(lambda r: confirm_pay_status(r, df_curr, shaho_keywords, acc_targets), axis=1)
+
+    df_curr['is_gensen_occur'] = df_curr.apply(lambda r: is_candidate_credit(r, gensen_keywords, acc_targets), axis=1)
+    df_curr['is_juumin_occur'] = df_curr.apply(lambda r: is_candidate_credit(r, juumin_keywords, acc_targets), axis=1)
+    df_curr['is_shaho_occur'] = df_curr.apply(lambda r: is_candidate_credit(r, shaho_keywords, acc_targets), axis=1)
+
+    # 納期特例モードの自動判定 (源泉所得税)
+    is_gensen_tokurei = False
+    if months_count >= 6:
+        gensen_pay_count = df_curr['is_gensen_pay'].sum()
+        # 6ヶ月以上の期間で、源泉所得税の支払回数が年換算で2回以下 (支払回数/月数 <= 2/12)
+        if (gensen_pay_count / months_count) <= (2.0 / 12.0):
+            is_gensen_tokurei = True
+
+    # 発生が1件でもあるか確認
+    has_gensen_any = df_curr['is_gensen_occur'].any()
+    has_juumin_any = df_curr['is_juumin_occur'].any()
+    has_shaho_any = df_curr['is_shaho_occur'].any()
 
     if has_gensen_any or has_juumin_any or has_shaho_any:
-        # 時系列順の月リスト
         months = sorted(df_curr['year_month'].unique())
-        
         unconfirmed_months = 0
-        monthly_retained = [] # 各月の滞留フラグ (is_retained, R_next)
+        monthly_retained = []
+        max_date = df_curr['date'].max()
         
         for idx, m in enumerate(months):
             df_m = df_curr[df_curr['year_month'] == m]
             
-            # 各科目の発生有無
-            credit_gensen = df_m.apply(is_gensen_credit, axis=1).any()
-            credit_juumin = df_m.apply(is_juumin_credit, axis=1).any()
-            credit_shaho = df_m.apply(is_shaho_credit, axis=1).any()
+            has_gensen_occur = df_m['is_gensen_occur'].any()
+            has_juumin_occur = df_m['is_juumin_occur'].any()
+            has_shaho_occur = df_m['is_shaho_occur'].any()
             
-            # 翌月15日、翌々月5日の期限算出
             limit_15 = m.start_time + pd.DateOffset(months=1, days=14)
             limit_next_5 = m.start_time + pd.DateOffset(months=2, days=4)
             
             month_unconfirmed = False
             
             # 1. 源泉所得税のチェック
-            if credit_gensen:
-                # 当月〜翌月15日までの出金仕訳があるか
-                df_gensen_debit = df_curr[df_curr.apply(is_gensen_debit, axis=1)]
-                has_pay = not df_gensen_debit[(df_gensen_debit['date'] >= m.start_time) & (df_gensen_debit['date'] <= limit_15)].empty
-                if not has_pay:
-                    month_unconfirmed = True
-                    
+            if has_gensen_occur:
+                if not is_gensen_tokurei:
+                    # 通常：当月〜翌月15日までに納付があるか
+                    df_g_pay = df_curr[df_curr['is_gensen_pay']]
+                    has_pay = not df_g_pay[(df_g_pay['date'] >= m.start_time) & (df_g_pay['date'] <= limit_15)].empty
+                    if not has_pay:
+                        month_unconfirmed = True
+                else:
+                    # 納期特例モード
+                    if 1 <= m.month <= 6:
+                        target_limit = pd.Timestamp(year=m.year, month=7, day=20)
+                        if max_date >= target_limit:
+                            df_g_pay = df_curr[df_curr['is_gensen_pay']]
+                            has_pay = not df_g_pay[(df_g_pay['date'] >= m.start_time) & (df_g_pay['date'] <= target_limit)].empty
+                            if not has_pay:
+                                month_unconfirmed = True
+                    else:
+                        target_limit = pd.Timestamp(year=m.year + 1, month=1, day=31)
+                        if max_date >= target_limit:
+                            df_g_pay = df_curr[df_curr['is_gensen_pay']]
+                            has_pay = not df_g_pay[(df_g_pay['date'] >= m.start_time) & (df_g_pay['date'] <= target_limit)].empty
+                            if not has_pay:
+                                month_unconfirmed = True
+                                
             # 2. 住民税のチェック
-            if credit_juumin:
-                df_juumin_debit = df_curr[df_curr.apply(is_juumin_debit, axis=1)]
-                has_pay = not df_juumin_debit[(df_juumin_debit['date'] >= m.start_time) & (df_juumin_debit['date'] <= limit_15)].empty
+            if has_juumin_occur:
+                df_j_pay = df_curr[df_curr['is_juumin_pay']]
+                has_pay = not df_j_pay[(df_j_pay['date'] >= m.start_time) & (df_j_pay['date'] <= limit_15)].empty
                 if not has_pay:
                     month_unconfirmed = True
                     
             # 3. 社会保険料のチェック
-            if credit_shaho:
-                df_shaho_debit = df_curr[df_curr.apply(is_shaho_debit, axis=1)]
-                has_pay = not df_shaho_debit[(df_shaho_debit['date'] >= m.start_time) & (df_shaho_debit['date'] <= limit_next_5)].empty
+            if has_shaho_occur:
+                df_s_pay = df_curr[df_curr['is_shaho_pay']]
+                has_pay = not df_s_pay[(df_s_pay['date'] >= m.start_time) & (df_s_pay['date'] <= limit_next_5)].empty
                 if not has_pay:
                     month_unconfirmed = True
                     
-            # いずれかの科目の支払チェック対象（発生あり）があり、支払が未確認なら未確認月としてカウント
-            if (credit_gensen or credit_juumin or credit_shaho) and month_unconfirmed:
+            if (has_gensen_occur or has_juumin_occur or has_shaho_occur) and month_unconfirmed:
                 unconfirmed_months += 1
                 
-            # 4. 滞留確認（2ヶ月目以降）
+            # 4. 滞留確認
             is_retained = False
             R_next = 0.0
-            if idx > 0 and (idx < len(months) - 1): # 翌月のデータが存在する月のみ
+            if idx > 0 and (idx < len(months) - 1):
                 next_m = months[idx + 1]
                 df_two_months = df_curr[(df_curr['year_month'] == m) | (df_curr['year_month'] == next_m)]
                 
-                # 当月の天引き額 (A_m)
-                A_m = df_m.apply(lambda r: r['credit_amount'] if pd.notna(r['credit_amount']) and (is_gensen_credit(r) or is_juumin_credit(r) or is_shaho_credit(r)) else 0.0, axis=1).sum()
-                
-                # 当月および翌月の発生額合計
-                total_credit = df_two_months.apply(lambda r: r['credit_amount'] if pd.notna(r['credit_amount']) and (is_gensen_credit(r) or is_juumin_credit(r) or is_shaho_credit(r)) else 0.0, axis=1).sum()
-                
-                # 当月および翌月の支払額合計
-                total_debit = df_two_months.apply(lambda r: r['debit_amount'] if pd.notna(r['debit_amount']) and (is_gensen_debit(r) or is_juumin_debit(r) or is_shaho_debit(r)) else 0.0, axis=1).sum()
+                # 納期特例モードの場合は、月次の滞留判定（2ヶ月連続未納等のチェック）から源泉所得税を除外する
+                if is_gensen_tokurei:
+                    is_occur_target = lambda r: r['is_juumin_occur'] or r['is_shaho_occur']
+                    is_pay_target = lambda r: r['is_juumin_pay'] or r['is_shaho_pay']
+                else:
+                    is_occur_target = lambda r: r['is_gensen_occur'] or r['is_juumin_occur'] or r['is_shaho_occur']
+                    is_pay_target = lambda r: r['is_gensen_pay'] or r['is_juumin_pay'] or r['is_shaho_pay']
+
+                A_m = df_m.apply(lambda r: r['credit_amount'] if pd.notna(r['credit_amount']) and is_occur_target(r) else 0.0, axis=1).sum()
+                total_credit = df_two_months.apply(lambda r: r['credit_amount'] if pd.notna(r['credit_amount']) and is_occur_target(r) else 0.0, axis=1).sum()
+                total_debit = df_two_months.apply(lambda r: r['debit_amount'] if pd.notna(r['debit_amount']) and is_pay_target(r) else 0.0, axis=1).sum()
                 
                 R_next = total_credit - total_debit
                 if R_next < 0.0:
@@ -222,14 +296,14 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
                     
             monthly_retained.append((is_retained, R_next))
             
-        # 連続滞留判定（2ヶ月以上連続）
+        # 連続滞留判定
         has_continuous_ret = False
         for i_idx in range(len(monthly_retained) - 1):
             if monthly_retained[i_idx][0] and monthly_retained[i_idx+1][0]:
                 has_continuous_ret = True
                 break
                 
-        # 増加傾向判定（3ヶ月連続で5%以上増加）
+        # 増加傾向判定
         has_increasing_trend = False
         for i_idx in range(len(monthly_retained) - 2):
             v1 = monthly_retained[i_idx][1]
@@ -239,22 +313,26 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
                 has_increasing_trend = True
                 break
                 
-        # 滞留月が1ヶ月でもあるか（単発滞留）
         has_any_ret = any(item[0] for item in monthly_retained)
         
-        # 判定決定
         if unconfirmed_months >= 5 or has_continuous_ret or has_increasing_trend:
             color = "red"
             res = "規律再設計期"
             comment = "納付確認が複数月で確認できず、資金規律の再整理が必要となる可能性があります。"
+            if is_gensen_tokurei:
+                comment += "（※源泉所得税は納期特例が適用されていると推定されます）"
         elif unconfirmed_months >= 3 or has_any_ret:
             color = "yellow"
             res = "規律一部変動"
             comment = "一部月において納付確認が遅延する傾向が見られます。資金規律の整理余地があります。"
+            if is_gensen_tokurei:
+                comment += "（※源泉所得税は納期特例が適用されていると推定されます）"
         else:
             color = "blue"
             res = "資金規律安定"
             comment = "税金および社会保険料は概ね期日通り納付されています。"
+            if is_gensen_tokurei:
+                comment += "（※源泉所得税は納期特例が適用されていると推定されます）"
             
         results.append(["① 資金繰り", "税金・社会保険料の納付確認", res, comment, color])
 
@@ -262,8 +340,21 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
     # 2.1 仕訳入力遅延
     if 'created_at' in df_j.columns and df_j['created_at'].notna().any():
         df_j['created_at_dt'] = pd.to_datetime(df_j['created_at'], errors='coerce')
-        df_j['date_dt'] = pd.to_datetime(df_j['date'])
-        df_j['delay'] = (df_j['created_at_dt'] - df_j['date_dt']).dt.days
+        df_j['date_dt'] = pd.to_datetime(df_j['date'], errors='coerce')
+        
+        # NaTや異常な日付（2000年以前や2100年以降など）を除外した有効な行のみを対象にし、オーバーフローやバグを防ぐ
+        valid_mask = (
+            df_j['created_at_dt'].notna() & 
+            df_j['date_dt'].notna() & 
+            (df_j['created_at_dt'].dt.year >= 2000) & 
+            (df_j['created_at_dt'].dt.year <= 2100) &
+            (df_j['date_dt'].dt.year >= 2000) & 
+            (df_j['date_dt'].dt.year <= 2100)
+        )
+        df_j['delay'] = np.nan
+        if valid_mask.any():
+            df_j.loc[valid_mask, 'delay'] = (df_j.loc[valid_mask, 'created_at_dt'] - df_j.loc[valid_mask, 'date_dt']).dt.days
+            
         delayed_count = (df_j['delay'] > 15).sum()
         total_count = df_j['created_at_dt'].notna().sum()
         delay_rate = (delayed_count / total_count) * 100 if total_count > 0 else 0
@@ -321,20 +412,69 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
 
     # 2.3 入金サイト延伸
     if months_count >= 13 and not df_prev.empty:
-        ar_patterns = ["売掛金", "未収入金"]
+        ar_patterns = ["売掛金", "未収入金", "買入金銭債権"]
         df_j['is_ar'] = df_j['debit_account'].apply(lambda x: is_match(x, ar_patterns)) | \
                        df_j['credit_account'].apply(lambda x: is_match(x, ar_patterns))
         
         def calc_ar_days(target_df):
-            valid_df = target_df[~target_df['partner'].astype(str).str.contains('期首|開始|繰越', na=False)]
-            sales_patterns_ar = ["売上", "売上高", "未収入金"]
-            sales = valid_df.apply(lambda r: (r['credit_amount'] if pd.notna(r['credit_amount']) else 0) if is_match(r['credit_account'], sales_patterns_ar) else 0, axis=1).sum()
-            ar_debits = valid_df.apply(lambda r: (r['debit_amount'] if pd.notna(r['debit_amount']) else 0) if is_match(r['debit_account'], ar_patterns) else 0, axis=1).sum()
+            if target_df.empty:
+                return 0.0
+                
+            min_date = target_df['date'].min()
+            max_date = target_df['date'].max()
+            
+            # 期首日（最小日付の月の1日）
+            start_date = pd.Timestamp(year=min_date.year, month=min_date.month, day=1)
+            # 期末日（最大日付の月の最終日）
+            if max_date.month == 12:
+                end_date = pd.Timestamp(year=max_date.year + 1, month=1, day=1) - pd.Timedelta(days=1)
+            else:
+                end_date = pd.Timestamp(year=max_date.year, month=max_date.month + 1, day=1) - pd.Timedelta(days=1)
+            
+            # 補正実日数
+            period_days = (end_date - start_date).days + 1
+            if period_days <= 0:
+                period_days = 365
+                
+            # 2年目以降の繰越・開始仕訳を除外するフィルター
+            is_carryover = (target_df['date'] > start_date) & (
+                target_df['partner'].astype(str).str.contains('開始仕訳|期首|繰越', na=False) |
+                target_df['debit_account'].astype(str).str.contains('前期繰越|元入金', na=False) |
+                target_df['credit_account'].astype(str).str.contains('前期繰越|元入金', na=False)
+            )
+            clean_df = target_df[~is_carryover].copy()
+            
+            # 期首残高仕訳（真の期首日の借方売掛金/未収入金）
+            is_opening = (clean_df['date'] == start_date) & clean_df['debit_account'].apply(lambda x: is_match(x, ar_patterns))
+            opening_df = clean_df[is_opening]
+            
+            # 全体の期首残高
+            total_op = opening_df['debit_amount'].sum()
+            
+            # 全体の期中発生額（借方）と回収額（貸方）の集計
+            is_debit_ar = clean_df['debit_account'].apply(lambda x: is_match(x, ar_patterns))
+            is_credit_ar = clean_df['credit_account'].apply(lambda x: is_match(x, ar_patterns))
+            
+            mid_debit_df = clean_df[is_debit_ar & ~is_opening]
+            total_deb = mid_debit_df['debit_amount'].sum()
+            
+            credit_df = clean_df[is_credit_ar]
+            total_cred = credit_df['credit_amount'].sum()
+            
+            # 逆算フォールバック（全体レベルで回収が多すぎる場合のみ期首を補正）
+            total_op_adj = max(total_op, total_cred - total_deb)
+            
+            # 期末の全体売掛残高
+            total_ending_ar = total_op_adj + total_deb - total_cred
+            
+            # 期間売上高の集計
+            sales_patterns_ar = ["売上", "売上高"]
+            sales = clean_df.apply(lambda r: (r['credit_amount'] if pd.notna(r['credit_amount']) else 0) if is_match(r['credit_account'], sales_patterns_ar) else 0, axis=1).sum()
             
             if sales <= 1000:
-                return 0
-            
-            days = (ar_debits / sales * 365)
+                return 0.0
+                
+            days = (total_ending_ar / sales) * period_days
             return min(days, 999.0)
 
         ar_days_curr = calc_ar_days(df_curr)
@@ -349,13 +489,13 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
             else:
                 if diff >= 5:
                     color = "red"
-                    comment = f"回収期間（売掛金回転日数）が前年比で{diff:+.1f}日と、5日以上延伸しています。支払期限の遅延や回収条件の悪化が発生している懸念があり、早期の回収状況確認が必要です。"
+                    comment = f"回収期間（売掛金回転日数）が前年比で{diff:+.1f}日（前年: {ar_days_prev:.1f}日、当年: {ar_days_curr:.1f}日）と、5日以上延伸しています。支払期限の遅延や回収条件の悪化が発生している懸念があり、早期の回収状況確認が必要です。"
                 elif diff <= 0:
                     color = "blue"
-                    comment = f"回収期間が前年比で{diff:+.1f}日と、維持または短縮されています（0日以下）。回収業務は健全に行われています。"
+                    comment = f"回収期間が前年比で{diff:+.1f}日（前年: {ar_days_prev:.1f}日、当年: {ar_days_curr:.1f}日）と、維持または短縮されています（0日以下）。回収業務は健全に行われています。"
                 else:
                     color = "yellow"
-                    comment = f"回収期間が前年比で{diff:+.1f}日と、わずかに延伸しています（0日超5日未満）。大きな変化ではありませんが、売掛金の滞留がないか定期的なチェックをお勧めします。"
+                    comment = f"回収期間が前年比で{diff:+.1f}日（前年: {ar_days_prev:.1f}日、当年: {ar_days_curr:.1f}日）と、わずかに延伸しています（0日超5日未満）。大きな変化ではありませんが、売掛金の滞留がないか定期的なチェックをお勧めします。"
                 results.append(["② 会計品質", "入金サイト延伸", f"{diff:+.1f}日", comment, color])
     else:
         results.append(["② 会計品質", "入金サイト延伸", "なし", "データが12ヶ月分のみのため判定できません", "grey"])

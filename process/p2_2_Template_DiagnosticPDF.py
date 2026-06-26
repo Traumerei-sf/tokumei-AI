@@ -123,13 +123,7 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame, accounting_period: str) -> 
     pdf.set_text_color(0, 0, 0)
     pdf.ln(5)
     
-    # ③ 画像の挿入 (中央揃え)
-    img_path = os.path.join("assets", "特命AI_レポート画像_1.jpeg")
-    if os.path.exists(img_path):
-        # ページ中央に配置 (A4横幅は210mm)
-        img_width = 40
-        pdf.image(img_path, x=(210 - img_width) / 2, w=img_width)
-        pdf.ln(5)
+
 
     # ④ 診断結果表
     pdf.set_font_size(9)
@@ -165,7 +159,7 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame, accounting_period: str) -> 
     # テーブルの描画 (fpdf2のtable機能を使用)
     with pdf.table(
         width=190, 
-        col_widths=(15, 25, 15, 67, 68),
+        col_widths=(15, 25, 15, 50, 85),
         text_align=("LEFT", "LEFT", "CENTER", "LEFT", "LEFT"),
         borders_layout="ALL",
         line_height=6,
@@ -186,18 +180,7 @@ def render_diagnostic_pdf(analysis_df: pd.DataFrame, accounting_period: str) -> 
                 for datum in data_row:
                     row.cell(datum, style=style)
 
-    pdf.ln(10)
-    
-    # ⑤ 最後の一文
-    pdf.set_font(font_family, size=11)
-    footer_text = (
-        "これらの数値が貴社の「肌感覚」と一致しているか、\n"
-        "至急、「答え合わせ」の面談(30分)をお願いいたします。\n"
-        "これは、貴社の未来を左右する重大な警告です。\n"
-        "早急にご連絡ください。\n\n"
-        "大阪キャピタル株式会社　宮田幸治"
-    )
-    pdf.multi_cell(0, 7, footer_text, align="L")
+
 
     # PDFバイナリ取得
     pdf_bytes = bytes(pdf.output())

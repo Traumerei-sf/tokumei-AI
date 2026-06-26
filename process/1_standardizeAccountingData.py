@@ -7,7 +7,7 @@ from process.u_accessGemini import exe_gemini_structure_forJournal, exe_gemini_s
 
 # --- 定数定義 ---
 STANDARD_JOURNAL_COLUMNS = [
-    "date", "debit_account", "debit_amount", "credit_account", "credit_amount", "partner", "created_at"
+    "date", "debit_account", "debit_amount", "credit_account", "credit_amount", "partner", "created_at", "transaction_no", "debit_partner", "credit_partner"
 ]
 
 def load_file_to_df(file: io.BytesIO) -> pd.DataFrame:
@@ -75,7 +75,13 @@ def process_journal_single(file: io.BytesIO, file_num: int = 1) -> Tuple[Optiona
 - debit_amount: 借方金額
 - credit_account: 貸方勘定科目
 - credit_amount: 貸方金額
-- partner: 取引先名称や摘要（相手先）。借方・貸方などの区別は不要で、その取引行の代表的な1列だけを特定してください。
+- partner: 取引先名称や摘要、備考、または取引内容が書かれた代表的な列の列番号
+- debit_partner: 借方の補助科目、または借方の取引先名が記載されている列（例:「借方 補助科目」「補助科目(借方)」「補助科目」など。存在しない場合は null）
+- credit_partner: 貸方の補助科目、または貸方の取引先名が記載されている列（例:「貸方 補助科目」「補助科目(貸方)」「補助科目」など。存在しない場合は null）
+  ※「補助科目」列が借方・貸方で分かれておらず、1つしか無い場合は、debit_partner と credit_partner の両方にその同じ列番号を指定してください。
+- transaction_no: 同一の取引（複合仕訳など）をバインドするための「伝票No.」「仕訳No」「伝票No」「No」等の識別子が記載されている列。
+  ※【極めて重要】ヘッダーに「伝票No.」や「伝票番号」などの明確なラベルが存在する列を最優先で選んでください。
+  ※【極めて重要】0列目などに入っている「単なる行インデックス（1, 2, 3... や 17111, 17112... のような単なる行番号）」は取引No（伝票No）ではありません。ヘッダーが空欄で単なる行の連番になっている列は、絶対に transaction_no にマッピングせず、null を指定してください。
 - created_at: 作成日時/入力日時（作成日時, 入力日付時間, 入力日付, 登録日時, 入力日, 入力日時, 仕分日, 仕分日時, Created At 等）
 
 【サンプルデータ】
@@ -114,12 +120,56 @@ def process_journal_single(file: io.BytesIO, file_num: int = 1) -> Tuple[Optiona
 
         # 5. データ抽出 (Wide形式)
         extracted_data = {}
+        
+        debit_part_idx = mapping.get("debit_partner")
+        credit_part_idx = mapping.get("credit_partner")
+        partner_idx = mapping.get("partner")
+        
+        debit_acc_idx = mapping.get("debit_account")
+        credit_acc_idx = mapping.get("credit_account")
+        
+        merged_partner = None
+        if (debit_part_idx is not None and debit_part_idx < len(df_raw.columns)) or \
+           (credit_part_idx is not None and credit_part_idx < len(df_raw.columns)) or \
+           (partner_idx is not None and partner_idx < len(df_raw.columns)):
+            
+            debit_series = df_raw.iloc[start_row:, debit_part_idx].reset_index(drop=True) if (debit_part_idx is not None and debit_part_idx < len(df_raw.columns)) else pd.Series(pd.NA, index=range(len(df_raw) - start_row))
+            credit_series = df_raw.iloc[start_row:, credit_part_idx].reset_index(drop=True) if (credit_part_idx is not None and credit_part_idx < len(df_raw.columns)) else pd.Series(pd.NA, index=range(len(df_raw) - start_row))
+            base_partner = df_raw.iloc[start_row:, partner_idx].reset_index(drop=True) if (partner_idx is not None and partner_idx < len(df_raw.columns)) else pd.Series(pd.NA, index=range(len(df_raw) - start_row))
+            
+            debit_acc_series = df_raw.iloc[start_row:, debit_acc_idx].reset_index(drop=True) if (debit_acc_idx is not None and debit_acc_idx < len(df_raw.columns)) else pd.Series("", index=range(len(df_raw) - start_row))
+            credit_acc_series = df_raw.iloc[start_row:, credit_acc_idx].reset_index(drop=True) if (credit_acc_idx is not None and credit_acc_idx < len(df_raw.columns)) else pd.Series("", index=range(len(df_raw) - start_row))
+            
+            # 口座・現金科目の判定パターン
+            yokin_pat = "預金|現金|当座|普通|手形|電信"
+            
+            # 借方/貸方が預金科目の場合は、その補助科目を無効化（NaNにする）
+            # なぜなら口座名は取引先名ではないからである
+            is_debit_yokin = debit_acc_series.astype(str).str.contains(yokin_pat, na=False)
+            is_credit_yokin = credit_acc_series.astype(str).str.contains(yokin_pat, na=False)
+            
+            debit_series_cleaned_yokin = debit_series.copy()
+            debit_series_cleaned_yokin[is_debit_yokin] = pd.NA
+            
+            credit_series_cleaned_yokin = credit_series.copy()
+            credit_series_cleaned_yokin[is_credit_yokin] = pd.NA
+            
+            # NaNや空欄を適切に処理してマージ (debit_partner -> credit_partner -> partner の優先順位)
+            debit_series_clean = debit_series_cleaned_yokin.replace(r'^\s*$', pd.NA, regex=True)
+            credit_series_clean = credit_series_cleaned_yokin.replace(r'^\s*$', pd.NA, regex=True)
+            base_partner_clean = base_partner.replace(r'^\s*$', pd.NA, regex=True)
+            
+            merged_partner = debit_series_clean.fillna(credit_series_clean).fillna(base_partner_clean)
+        
         for std_name in STANDARD_JOURNAL_COLUMNS:
-            col_idx = mapping.get(std_name)
-            if col_idx is not None and col_idx < len(df_raw.columns):
-                extracted_data[std_name] = df_raw.iloc[start_row:, col_idx].reset_index(drop=True)
+            if std_name == "partner" and merged_partner is not None:
+                extracted_data["partner"] = merged_partner
             else:
-                extracted_data[std_name] = pd.NA
+                col_idx = mapping.get(std_name)
+                if col_idx is not None and col_idx < len(df_raw.columns):
+                    extracted_data[std_name] = df_raw.iloc[start_row:, col_idx].reset_index(drop=True)
+                else:
+                    extracted_data[std_name] = pd.NA
         df_wide = pd.DataFrame(extracted_data)
         
         # 6. クリーニング
@@ -154,55 +204,58 @@ def process_journal_single(file: io.BytesIO, file_num: int = 1) -> Tuple[Optiona
 
         def clean_partner(val):
             if pd.isna(val) or str(val).strip() == "": return pd.NA
+            import unicodedata
             s = str(val)
             
-            # 1. メタデータ的な塊を削除（依頼人名:以降の連続する文字列など）
-            s = re.sub(r"\(?依頼人名:\S*", "", s)
-            s = re.sub(r"振込予定日:\S*", "", s)
-            s = re.sub(r"管理番号:\S*", "", s)
+            # 0. Unicode正規化 (半角カタカナを全角に、全角英数を半角に統一し、濁点等も合体)
+            s = unicodedata.normalize('NFKC', s)
             
-            # 追加: X月分、令和X年X月分などの日付メタデータを削除
-            s = re.sub(r"(?:令和|平成|昭和)\d+年(?:度)?\d+月(?:分|度)?", "", s)
-            s = re.sub(r"年\d+月(?:分|度)?", "", s)
-            s = re.sub(r"\d+月(?:分|度)?", "", s)
-
-            # 追加: 業務関連の定型ワードを削除
-            biz_words = [
-                "業務委託費用", "業務委託費", "業務委託料", "業務委託",
-                "コンサルティング報酬", "コンサルティング費用", "コンサルティング手数料", "コンサルティング料", "コンサルティング", "コンサルタント料",
-                "アドバイザリー費用", "インスタグラム運用代行", "運用代行",
-                "初期費用", "月額費用", "共同事業分", "年契約", "経営パートナー契約",
-                "稼働料金", "コスト削減", "採用戦略", "経営", "返金？", "作成", "代行"
+            # 1. プレフィックス（振込、フリコミなど）の除去（先頭一致）
+            prefix_patterns = [
+                r"^(?:振込|フリコミ|ﾌﾘｺﾐ|振込口|組戻|クミモドシ|クミモド|トウニユウ|トウニュウ|トウニユウグチ)",
+                r"^(?:ネット|ネツト)",
             ]
-            for w in biz_words:
-                s = s.replace(w, "")
+            for pat in prefix_patterns:
+                s = re.sub(pat, "", s)
                 
-            # 2. 定型ノイズワードを削除（完全一致部分のみ）
-            noise_words = [
-                "他行振込手数料", "振込手数料", "手数料", "他行振込", "組戻手数料", "現金売上", "現金仕入",
-                "消費税", "普通預金", "当座預金", "普通", "当座", "法人立ち上げ"
+            # 2. 法人格の除去（全角・半角、カッコ付き、ピリオド、カタカナなど様々なパターン）
+            corp_patterns = [
+                r"株式会社", r"有限会社", r"合資会社", r"合名会社", r"合同会社",
+                r"\(株\)", r"（株）", r"\(有\)", r"（有）", r"\(合\)", r"（合）",
+                r"㈱", r"㈲", r"㈴", r"㈵", r"法人",
+                # カタカナ法人格
+                r"カブシキガイシャ", r"ユウゲンガイシャ", r"ゴウドウガイシャ",
+                r"\(カ\)", r"（カ）", r"カ\)", r"\(カ", r"（カ", r"カ）",
+                r"カ\.", r"\.カ",
+                r"\(ユ\)", r"（ユ）", r"ユ\)", r"\(ユ\)", r"（ユ", r"ユ）",
+                r"ユ\.", r"\.ユ",
+                r"トクヒ\)", r"\(トクヒ", r"トクヒ"
             ]
-            for w in noise_words:
-                s = s.replace(w, "")
-                
-            # 3. 銀行・支店・長い数字（口座番号）などを削除
-            s = re.sub(r"\S*銀行", "", s)
-            s = re.sub(r"\S*信用金庫", "", s)
-            s = re.sub(r"\S*信用組合", "", s)
-            s = re.sub(r"\S*支店", "", s)
-            s = re.sub(r"\d{4,}", "", s) # 4桁以上の数字
+            for pat in corp_patterns:
+                s = re.sub(pat, "", s)
             
-            # 4. 全てのスペースを削除（名寄せのため）
-            s = s.replace(" ", "").replace("　", "")
+            # 3. 改行・タブを除去（スペースは後続の処理で利用するため残す）
+            s = s.replace("\n", "").replace("\r", "").replace("\t", "")
             
-            # 5. 先頭や末尾に取り残された孤立したカッコなどの除去
-            s = re.sub(r"^[(\[【]+|[)\]】]+$", "", s)
+            # 4. 先頭や末尾に取り残された孤立したカッコや記号の除去
+            s = re.sub(r"^[(\[【.\-_ー]+|[)\]】.\-_ー]+$", "", s)
             
             s = s.strip()
             return s if s else pd.NA
 
         if "partner" in df_wide.columns:
             df_wide["partner"] = df_wide["partner"].apply(clean_partner)
+        if "debit_partner" in df_wide.columns:
+            df_wide["debit_partner"] = df_wide["debit_partner"].apply(clean_partner)
+        if "credit_partner" in df_wide.columns:
+            df_wide["credit_partner"] = df_wide["credit_partner"].apply(clean_partner)
+
+        # 取引Noのクレンジング (文字列として統一し、スペース等の不要な文字を除去、欠損値は NA)
+        # ※異なるファイル（年度）間で取引Noが重複するのを防ぐため、ファイル番号をプレフィックスとして付与します。
+        if "transaction_no" in df_wide.columns:
+            df_wide["transaction_no"] = df_wide["transaction_no"].fillna(pd.NA).astype(str).str.strip().replace(r'^\s*$', pd.NA, regex=True)
+            valid_tx = df_wide["transaction_no"].notna()
+            df_wide.loc[valid_tx, "transaction_no"] = f"{file_num}_" + df_wide.loc[valid_tx, "transaction_no"]
 
         # 日付前方埋め
         df_wide["date"] = df_wide["date"].ffill()
