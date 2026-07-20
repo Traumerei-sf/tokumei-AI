@@ -11,33 +11,32 @@ def login():
                 box-shadow: 0 4px 6px rgba(0,0,0,0.1);
                 background: white;
             }
+            /* ログイン中の裏側のローディングログ（SpinnerやToast）を強制非表示にする */
+            div[data-testid="stToastContainer"], 
+            div[data-testid="stStatusWidget"],
+            div[data-testid="stStatusContainer"],
+            .stSpinner {
+                display: none !important;
+            }
         </style>
     """, unsafe_allow_html=True)
 
     from datetime import datetime
     import pandas as pd
+    from process.u_googleSheets import read_sheet
 
     st.title("Tokumei AI - Login")
-    
+
     with st.form("login_form"):
         user_id = st.text_input("User ID")
         password = st.text_input("Password", type="password")
         submit = st.form_submit_button("Login", use_container_width=True)
-        
+
         if submit:
             try:
-                import urllib.parse
-                
-                # Spreadsheet ID
-                spreadsheet_id = st.secrets["SPREADSHEET_ID"]
-                worksheet_name = "アクセス管理"
-                
-                # Use direct CSV export URL for public sheets to avoid encoding issues with Japanese names
-                encoded_worksheet = urllib.parse.quote(worksheet_name)
-                csv_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_worksheet}"
-                
-                df = pd.read_csv(csv_url)
-                
+                # サービスアカウント経由でアクセス管理シートを読み取る(閲覧制限されたシートのため)
+                df = read_sheet("アクセス管理", ttl=0)
+
                 # Check for matching credentials
                 match = df[(df['id'] == user_id) & (df['password'] == password)]
                 
@@ -76,6 +75,9 @@ def login():
                     st.error("Invalid User ID or Password")
             except Exception as e:
                 st.error(f"An error occurred during login: {str(e)}")
+                
+    st.markdown("<p style='font-size: 12px; text-align: center; margin-top: 10px;'>ログインすることで、以下のプライバシーポリシーに同意したものとみなします。</p>", unsafe_allow_html=True)
+    st.page_link("pages/privacy.py", label="プライバシーポリシーを確認する", icon="🛡️")
 
 def logout():
     st.session_state["authenticated"] = False

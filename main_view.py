@@ -1,9 +1,11 @@
 import streamlit as st
 import pandas as pd
 import os
-import importlib
 from datetime import datetime
 from process.p2_2_Template_DiagnosticPDF import ESSENCE_MAP
+from process.a_standardizeAccountingData import process_journal_single, process_bs_single
+from process.b_createDiagnosticReportPdf import create_diagnostic_report
+from process.c_createBusinessList import create_business_list, create_supplier_list
 
 def show_main():
     # PC前提のワイドレイアウト設定
@@ -80,13 +82,7 @@ def show_main():
         
         # --- 非同期処理用のヘルパー関数 ---
         import threading
-        import importlib
         from streamlit.runtime.scriptrunner import add_script_run_ctx
-        
-        # 数字から始まるモジュールは直接importできないためimportlibを使用
-        SAD_module = importlib.import_module("process.1_standardizeAccountingData")
-        process_journal_single = SAD_module.process_journal_single
-        process_bs_single = SAD_module.process_bs_single
 
         def start_async_process(file, key_prefix):
             def task():
@@ -289,8 +285,7 @@ def show_main():
                             std_data["journal"] = pd.concat([std_data["journal"], st.session_state.get("j2_data")]).sort_values("date")
                         
                         # 2. 診断レポートの作成
-                        report_mod = importlib.import_module("process.2_createDiagnosticReportPdf")
-                        report_data = report_mod.create_diagnostic_report(
+                        report_data = create_diagnostic_report(
                             df_journal=std_data["journal"],
                             df_bs=std_data["bs"]
                         )
@@ -440,8 +435,7 @@ def show_main():
         # --- 営業先リスト作成のバックグラウンド実行（レポート表示後） ---
         if not st.session_state.get("biz_list_ready", False):
             with st.status("AIがおすすめ営業先候補を探しています...", expanded=True) as status:
-                biz_mod = importlib.import_module("process.3_createBusinessList")
-                df_full, df_preview = biz_mod.create_business_list(st.session_state["standardized_journal"])
+                df_full, df_preview = create_business_list(st.session_state["standardized_journal"])
                 st.session_state["business_list_full"] = df_full
                 st.session_state["business_list_preview"] = df_preview
                 st.session_state["biz_list_ready"] = True
@@ -488,8 +482,7 @@ def show_main():
         # --- 仕入先リスト作成のバックグラウンド実行 ---
         if st.session_state.get("biz_list_ready", False) and not st.session_state.get("supplier_list_ready", False):
             with st.status("AIがおすすめ仕入先候補を探しています...", expanded=True) as status:
-                biz_mod = importlib.import_module("process.3_createBusinessList")
-                df_full_s, df_prev_s = biz_mod.create_supplier_list(st.session_state["standardized_journal"])
+                df_full_s, df_prev_s = create_supplier_list(st.session_state["standardized_journal"])
                 st.session_state["supplier_list_full"] = df_full_s
                 st.session_state["supplier_list_preview"] = df_prev_s
                 st.session_state["supplier_list_ready"] = True

@@ -9,3 +9,8 @@ test/
 参照資料/
 advance-seer-468810-q3-8e74ba64174c.json
 
+# Additional ignores
+venv/
+.agents/
+AGENTS.md
+tmp_review/

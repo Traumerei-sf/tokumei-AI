@@ -7,6 +7,55 @@ from openpyxl.utils import get_column_letter
 from openpyxl.chart import LineChart, Reference
 from openpyxl.chart.layout import Layout, ManualLayout
 from typing import Tuple, Dict
+from process.partner_resolution import resolve_partner_columns
+from process.transaction_details import (
+    build_direct_sales_details,
+    consolidate_partner_aliases,
+    resolve_payment_partner_name,
+)
+
+VALID_TRANSACTION_NULL_STRINGS = {"", "nan", "none", "null", "<na>"}
+
+
+def has_valid_transaction_no(value) -> bool:
+    if pd.isna(value):
+        return False
+    return str(value).strip().lower() not in VALID_TRANSACTION_NULL_STRINGS
+
+
+def is_opening_entry(row: pd.Series) -> bool:
+    opening_keywords = ('開始仕訳', '期首', '前期繰越', '繰越')
+    fields = (
+        row.get('description'), row.get('partner'), row.get('debit_partner'), row.get('credit_partner'),
+        row.get('debit_account'), row.get('credit_account')
+    )
+    return any(
+        keyword in str(value)
+        for value in fields if pd.notna(value)
+        for keyword in opening_keywords
+    )
+
+
+def exclude_opening_cash_movements(df: pd.DataFrame) -> pd.DataFrame:
+    """1年目・2年目の期首にある開始／繰越仕訳の現預金増減をゼロにする。"""
+    result = df.copy()
+    min_date = result['date'].min()
+    if pd.isna(min_date):
+        return result
+
+    first_opening_date = pd.Timestamp(min_date.year, min_date.month, 1)
+    second_opening_date = first_opening_date + pd.DateOffset(years=1)
+    is_target_opening_date = result['date'].isin([first_opening_date, second_opening_date])
+    opening_row = result.apply(is_opening_entry, axis=1)
+    opening_transaction_nos = set(
+        result.loc[is_target_opening_date & opening_row, 'transaction_no']
+            .dropna()
+            .loc[lambda s: s.apply(has_valid_transaction_no)]
+    )
+    same_opening_transaction = result['transaction_no'].isin(opening_transaction_nos)
+    is_opening_journal = is_target_opening_date & (opening_row | same_opening_transaction)
+    result.loc[is_opening_journal, 'cash_diff'] = 0.0
+    return result
 
 # ==========================================================
 # 「資金移動用途推定」シート専用の列幅設定（文字数換算）
@@ -41,6 +90,52 @@ def format_journal_entry(account, sub_account, partner, amount) -> str:
     
     return f"【{acc_str}】{middle_str}（{amt_str}円）"
 
+
+def build_sales_receipt_list(df_receipts: pd.DataFrame, journal: pd.DataFrame) -> pd.DataFrame:
+    """売掛金回収について、債権回収額・実入金額・手数料を分けて表示する。"""
+    columns = ["日付", "金額", "売掛金回収額", "実入金額", "差額", "振込手数料",
+               "対応状態", "相手科目(借方/貸方)", "摘要", "貸方補助科目"]
+    if df_receipts.empty:
+        return pd.DataFrame(columns=columns)
+
+    fee_mask = journal["debit_account"].fillna("").astype(str).str.contains("支払手数料", na=False)
+    fees = journal[fee_mask].copy()
+    fees["_fee_amount"] = pd.to_numeric(fees["debit_amount"], errors="coerce").fillna(0.0)
+    used_fee_indices = set()
+    records = []
+
+    for _, row in df_receipts.iterrows():
+        gross_value = pd.to_numeric(row.get("credit_amount"), errors="coerce")
+        net_value = pd.to_numeric(row.get("debit_amount"), errors="coerce")
+        gross = 0.0 if pd.isna(gross_value) else float(gross_value)
+        net = 0.0 if pd.isna(net_value) else float(net_value)
+        difference = max(gross - net, 0.0)
+        matched_fee = 0.0
+
+        transaction_no = row.get("transaction_no")
+        if has_valid_transaction_no(transaction_no) and difference > 0:
+            candidates = fees[
+                (fees["transaction_no"] == transaction_no)
+                & (~fees.index.isin(used_fee_indices))
+                & ((fees["_fee_amount"] - difference).abs() <= 1.0)
+            ]
+            if not candidates.empty:
+                fee_index = candidates.index[0]
+                matched_fee = float(candidates.loc[fee_index, "_fee_amount"])
+                used_fee_indices.add(fee_index)
+
+        status = "一致" if difference == 0 else ("手数料一致" if matched_fee > 0 else "差額要確認")
+        partner = row.get("ar_partner")
+        if pd.isna(partner):
+            partner = row.get("credit_partner")
+        records.append({
+            "日付": row.get("date"), "金額": net, "売掛金回収額": gross,
+            "実入金額": net, "差額": gross - net, "振込手数料": matched_fee,
+            "対応状態": status, "相手科目(借方/貸方)": row.get("credit_account"),
+            "摘要": row.get("description"), "貸方補助科目": partner,
+        })
+    return pd.DataFrame(records, columns=columns).sort_values("日付")
+
 def cleanse_journal(df: pd.DataFrame) -> pd.DataFrame:
     """
     仕訳データのクレンジング処理。
@@ -54,18 +149,33 @@ def cleanse_journal(df: pd.DataFrame) -> pd.DataFrame:
     if debit_minus.any():
         for idx in df_clean[debit_minus].index:
             row = df_clean.loc[idx]
-            df_clean.loc[idx, ['debit_amount', 'credit_amount', 'debit_account', 'credit_account']] = \
-                [0.0, abs(row['debit_amount']), row['credit_account'], row['debit_account']]
+            df_clean.loc[idx, ['debit_amount', 'credit_amount', 'debit_account', 'credit_account', 'debit_partner', 'credit_partner']] = \
+                [0.0, abs(row['debit_amount']), row['credit_account'], row['debit_account'], row['credit_partner'], row['debit_partner']]
                 
     # 貸方金額がマイナスの場合の処理
     credit_minus = df_clean['credit_amount'] < 0
     if credit_minus.any():
         for idx in df_clean[credit_minus].index:
             row = df_clean.loc[idx]
-            df_clean.loc[idx, ['debit_amount', 'credit_amount', 'debit_account', 'credit_account']] = \
-                [abs(row['credit_amount']), 0.0, row['credit_account'], row['debit_account']]
+            df_clean.loc[idx, ['debit_amount', 'credit_amount', 'debit_account', 'credit_account', 'debit_partner', 'credit_partner']] = \
+                [abs(row['credit_amount']), 0.0, row['credit_account'], row['debit_account'], row['credit_partner'], row['debit_partner']]
                 
     return df_clean
+
+
+def select_long_ar_fill_key(origin_value, evaluation_value):
+    """長期未回収売掛の行色キー。発生原因による灰色を評価色より優先する。"""
+    origin = "" if pd.isna(origin_value) else str(origin_value)
+    evaluation = "" if pd.isna(evaluation_value) else str(evaluation_value)
+    if origin == "預金支出起点・要確認":
+        return "grey"
+    if "🔴" in evaluation or "長期滞留" in evaluation:
+        return "red"
+    if "🔶" in evaluation or "要整理" in evaluation:
+        return "orange"
+    if "⚠️" in evaluation or "注意" in evaluation:
+        return "yellow"
+    return None
 
 def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[bytes, Dict]:
     """
@@ -73,7 +183,8 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     また、売上計上思想指数の算出データを辞書形式で返す。
     """
     # 1. 仕訳クレンジング
-    df_j = cleanse_journal(df_journal)
+    # 負額仕訳の借貸反転後は、標準化時の解決済み列を使い回さず一度だけ再解決する。
+    df_j = resolve_partner_columns(cleanse_journal(df_journal), force=True)
     df_j['date'] = pd.to_datetime(df_j['date'], errors='coerce')
     df_j = df_j.dropna(subset=['date']).sort_values('date')
     
@@ -92,8 +203,11 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
         val_str = str(val)
         return any(kw in val_str for kw in all_keywords)
         
-    df_sales['is_target'] = df_sales['partner'].apply(contains_keywords)
-    df_sales_target = df_sales[df_sales['is_target']].copy()
+    # 空Seriesでもboolean maskとして扱えるようdtypeを固定する。
+    # dtype=objectの空Seriesを df[series] に渡すと列選択と解釈され、
+    # 後続で debit_amount / credit_amount が消えるため。
+    df_sales['is_target'] = df_sales['description'].apply(contains_keywords).astype(bool)
+    df_sales_target = df_sales.loc[df_sales['is_target']].copy()
     
     total_sales_count = len(df_sales)
     target_sales_count = len(df_sales_target)
@@ -109,13 +223,13 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     df_sheet1 = df_sales_target.copy()
     # 金額は最大値を取得（クレンジングで正の数に変換済み）
     df_sheet1['amount'] = df_sheet1[['debit_amount', 'credit_amount']].max(axis=1)
-    df_sheet1 = df_sheet1[['date', 'amount', 'partner', 'debit_account', 'credit_account', 'credit_partner']].rename(columns={'partner': '摘要', 'credit_partner': '貸方補助科目'})
+    df_sheet1 = df_sheet1[['date', 'amount', 'description', 'debit_account', 'credit_account', 'credit_partner']].rename(columns={'description': '摘要', 'credit_partner': '貸方補助科目'})
     df_sheet1 = df_sheet1.sort_values('date')
     
     # 2. 売上計上思想_全売上仕訳
     df_sheet2 = df_sales.copy()
     df_sheet2['amount'] = df_sheet2[['debit_amount', 'credit_amount']].max(axis=1)
-    df_sheet2 = df_sheet2[['date', 'amount', 'partner', 'debit_account', 'credit_account', 'credit_partner']].rename(columns={'partner': '摘要', 'credit_partner': '貸方補助科目'})
+    df_sheet2 = df_sheet2[['date', 'amount', 'description', 'debit_account', 'credit_account', 'credit_partner']].rename(columns={'description': '摘要', 'credit_partner': '貸方補助科目'})
     df_sheet2 = df_sheet2.sort_values('date')
     
     # --- 指標15: 売上入金・直入金売上リスト ---
@@ -127,27 +241,18 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
         df_j['debit_account'].str.contains(debit_pat, na=False) &
         df_j['credit_account'].str.contains(credit_pat, na=False)
     ].copy()
-    df_sheet3 = pd.DataFrame()
-    if not df_nyukin.empty:
-        df_sheet3['日付'] = df_nyukin['date']
-        df_sheet3['金額'] = df_nyukin['debit_amount']
-        df_sheet3['相手科目(借方/貸方)'] = df_nyukin['credit_account']
-        df_sheet3['摘要'] = df_nyukin['partner']
-        df_sheet3['貸方補助科目'] = df_nyukin['credit_partner']
-        df_sheet3 = df_sheet3.sort_values('日付')
+    df_sheet3 = build_sales_receipt_list(df_nyukin, df_j)
         
     # 4. 直入金売上
-    df_choku = df_j[
-        df_j['debit_account'].str.contains(debit_pat, na=False) &
-        df_j['credit_account'].str.contains('売上', na=False)
-    ].copy()
+    df_choku = build_direct_sales_details(df_j)
     df_sheet4 = pd.DataFrame()
     if not df_choku.empty:
         df_sheet4['日付'] = df_choku['date']
-        df_sheet4['金額'] = df_choku['debit_amount']
+        df_sheet4['金額'] = df_choku['amount']
         df_sheet4['相手科目(借方/貸方)'] = df_choku['credit_account']
-        df_sheet4['摘要'] = df_choku['partner']
-        df_sheet4['貸方補助科目'] = df_choku['credit_partner']
+        df_sheet4['摘要'] = df_choku['description']
+        df_sheet4['取引先'] = df_choku['partner']
+        df_sheet4['取引先取得元'] = df_choku['source']
         df_sheet4 = df_sheet4.sort_values('日付')
         
     # --- 指標16: 直払いリスト ---
@@ -157,7 +262,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     df_pay_base = df_j[is_credit_yokin & is_not_excluded].copy()
     
     def get_pay_category(row):
-        acc = str(row['debit_account'])
+        acc = f"{row.get('debit_account', '')} {row.get('debit_partner', '')}"
         if '仕入' in acc:
             return '仕入支払'
         elif '外注' in acc:
@@ -175,11 +280,14 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     
     df_sheet5 = pd.DataFrame()
     if not df_pay.empty:
+        df_pay['支払先'] = df_pay.apply(resolve_payment_partner_name, axis=1)
+        df_pay['支払先'] = consolidate_partner_aliases(df_pay['支払先']).fillna('取引先不明')
         df_sheet5['日付'] = df_pay['date']
         df_sheet5['金額'] = df_pay['credit_amount']
         df_sheet5['借方科目'] = df_pay['debit_account']
-        df_sheet5['摘要'] = df_pay['partner']
+        df_sheet5['摘要'] = df_pay['description']
         df_sheet5['借方補助科目'] = df_pay['debit_partner']
+        df_sheet5['支払先'] = df_pay['支払先']
         df_sheet5['カテゴリ'] = df_pay['category']
         df_sheet5 = df_sheet5.sort_values('日付')
         
@@ -201,12 +309,9 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
             axis=1
         )
         
-        # 期首月の1日（開始仕訳・繰越仕訳）の現預金増減を除外（0にする）
-        min_date = df_j['date'].min()
-        if pd.notna(min_date):
-            opening_month = min_date.month
-            is_opening_day = (df_j['date'].dt.month == opening_month) & (df_j['date'].dt.day == 1)
-            df_j.loc[is_opening_day, 'cash_diff'] = 0.0
+        # 1年目・2年目の期首日に計上された開始／繰越仕訳だけを除外する。
+        # 同じ取引Noの複合仕訳は、いずれかの行に開始／繰越表示があれば一括で除外する。
+        df_j = exclude_opening_cash_movements(df_j)
         
         # 日次で集計
         df_daily = df_j.groupby('date')['cash_diff'].sum().reset_index()
@@ -254,7 +359,10 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     # 支払・移動・税金仕訳の判定関数
     def get_payment_info(row):
         acc = str(row['debit_account']) if pd.notna(row['debit_account']) else ""
-        partner = str(row['partner']) if pd.notna(row['partner']) else ""
+        partner = " ".join(
+            str(value) for value in (row.get('description'), row.get('payment_partner'))
+            if pd.notna(value)
+        )
         
         # 0. 口座間移動（資金移動）
         if '預金' in acc or any(k in acc for k in ['当座', '普通', '定期', '別段']):
@@ -308,7 +416,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
         is_self_evident = False
         
         # A. 取引Noがある場合、その取引No全体の貸借が一致しているかを調べる
-        if pd.notna(t_no) and str(t_no).strip() != "":
+        if has_valid_transaction_no(t_no):
             related_txs = df_j[df_j['transaction_no'] == t_no]
             debit_sum = related_txs['debit_amount'].sum()
             credit_sum = related_txs['credit_amount'].sum()
@@ -316,32 +424,39 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
             # 貸借の合計金額がほぼ一致している場合（誤差1%以内）
             if debit_sum > 0 and abs(debit_sum - credit_sum) / debit_sum <= 0.01:
                 # 取引内にカード決済または現金引き出しが含まれているかチェック
-                has_card_or_cash = False
+                has_card = False
+                has_cash = False
                 for _, r in related_txs.iterrows():
                     p_type, _ = get_payment_info(r)
                     
                     # 補助科目や摘要にカードキーがある未払金の場合、カード決済に格上げする判定をここでも考慮
-                    has_card_kw = any(k in str(r['partner']) or k in str(r['credit_partner']) or k in str(r['debit_partner']) for k in card_kws_search)
+                    has_card_kw = any(k in str(r['description']) or k in str(r['credit_partner']) or k in str(r['debit_partner']) for k in card_kws_search)
                     if has_card_kw and '未払' in str(r['debit_account']):
                         p_type = 'カード決済'
                         
-                    if p_type in ['カード決済', '現金引き出し']:
-                        has_card_or_cash = True
-                        break
+                    if p_type == 'カード決済':
+                        has_card = True
+                    elif p_type == '現金引き出し':
+                        has_cash = True
                 
-                # カード決済・現金引き出しを含まない場合、「自明な取引」として除外
-                if not has_card_or_cash:
+                has_bank_transfer = related_txs['debit_account'].astype(str).str.contains(
+                    '預金|当座|普通|定期|別段', na=False
+                ).any()
+
+                # 預金間移動は出力対象として残す。それ以外の明白な取引だけを除外する。
+                is_non_compound_card = has_card and len(related_txs) == 1
+                if not has_cash and not is_non_compound_card and not has_bank_transfer:
                     is_self_evident = True
                     
         # B. 取引Noがない単一行仕訳の場合（金額一致かつカード・現金以外を除外）
         elif origin['debit_amount'] == origin['credit_amount'] and origin['debit_amount'] > 0:
             p_type, _ = get_payment_info(origin)
             
-            has_card_kw = any(k in str(origin['partner']) or k in str(origin['credit_partner']) or k in str(origin['debit_partner']) for k in card_kws_search)
+            has_card_kw = any(k in str(origin['description']) or k in str(origin['credit_partner']) or k in str(origin['debit_partner']) for k in card_kws_search)
             if has_card_kw and '未払' in str(origin['debit_account']):
                 p_type = 'カード決済'
                 
-            if p_type not in ['カード決済', '現金引き出し']:
+            if p_type not in ['カード決済', '現金引き出し', '口座間移動（資金移動）']:
                 is_self_evident = True
                 
         if is_self_evident:
@@ -353,7 +468,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
         debit_part_str = "（なし）"
         purpose = "用途不明（社長関連資金等）"
         related_debit = "（なし）"
-        related_credit = format_journal_entry(origin['credit_account'], origin['credit_partner'], origin['partner'], origin['credit_amount'])
+        related_credit = format_journal_entry(origin['credit_account'], origin['credit_partner'], origin['description'], origin['credit_amount'])
         
         match_type = "なし"
         confidence = "低"
@@ -369,25 +484,25 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
             purpose = p_type if p_type else "その他支払"
             
             # 補助科目や摘要にカードキーがある未払金の場合、カード決済に格上げ
-            has_card_kw = any(k in str(origin['partner']) or k in str(origin['credit_partner']) or k in str(origin['debit_partner']) for k in card_kws_search)
+            has_card_kw = any(k in str(origin['description']) or k in str(origin['credit_partner']) or k in str(origin['debit_partner']) for k in card_kws_search)
             if has_card_kw and '未払' in str(deb_acc):
                 purpose = "カード決済"
                 
-            # カード決済または現金引き出しの場合、時間軸探索へ進む
+            # カード決済は利用仕訳を時間軸で探索する。
             if purpose == "カード決済":
                 start_range = o_date - pd.Timedelta(days=60)
                 end_range = o_date - pd.Timedelta(days=20)
                 
                 card_name = ""
                 for kw in card_kws_search:
-                    if kw in str(origin['partner']) or kw in str(origin['credit_partner']) or kw in str(origin['debit_partner']):
+                    if kw in str(origin['description']) or kw in str(origin['credit_partner']) or kw in str(origin['debit_partner']):
                         card_name = kw
                         break
                 
                 if card_name:
                     card_use_cond = df_j['credit_account'].str.contains('未払金|未払費用', na=False) & \
                                     (df_j['credit_partner'].astype(str).str.contains(card_name, na=False) | \
-                                     df_j['partner'].astype(str).str.contains(card_name, na=False))
+                                     df_j['description'].astype(str).str.contains(card_name, na=False))
                 else:
                     card_use_cond = df_j['credit_account'].str.contains('未払金|未払費用', na=False)
                     
@@ -397,7 +512,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                     total_use_amt = near_card_uses['debit_amount'].sum()
                     debit_lines = []
                     for _, r in near_card_uses.iterrows():
-                        debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['partner'], r['debit_amount']))
+                        debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['description'], r['debit_amount']))
                     related_debit = "\n".join(debit_lines)
                     
                     matched_debit_amount = total_use_amt
@@ -415,38 +530,20 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                     is_resolved = True
                     
             elif purpose == "現金引き出し":
-                start_range = o_date
-                end_range = o_date + pd.Timedelta(days=10)
-                
-                cash_use_cond = df_j['credit_account'].str.contains('現金', na=False) & \
-                                ~df_j['debit_account'].str.contains('預金|現金|当座|普通', na=False)
-                                
-                near_cash_uses = df_j[cash_use_cond & (df_j['date'] >= start_range) & (df_j['date'] <= end_range)].copy()
-                
-                if not near_cash_uses.empty:
-                    total_use_amt = near_cash_uses['debit_amount'].sum()
-                    debit_lines = []
-                    for _, r in near_cash_uses.iterrows():
-                        debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['partner'], r['debit_amount']))
-                    related_debit = "\n".join(debit_lines)
-                    
-                    matched_debit_amount = total_use_amt
-                    debit_acc_str = ",".join(near_cash_uses['debit_account'].dropna().unique())
-                    debit_part_str = ",".join(near_cash_uses['debit_partner'].dropna().unique())
-                    match_type = "1対N"
-                    
-                    diff_pct = abs(total_use_amt - o_amt) / o_amt if o_amt != 0 else 999
-                    if diff_pct <= 0.02:
-                        confidence = "高"
-                    elif diff_pct <= 0.10:
-                        confidence = "中"
-                    else:
-                        confidence = "低"
-                    is_resolved = True
+                purpose = "現金引き出し（用途推定不可）"
+                related_debit = format_journal_entry(
+                    origin['debit_account'], origin['debit_partner'], origin['description'], origin['debit_amount']
+                )
+                matched_debit_amount = origin['debit_amount']
+                debit_acc_str = origin['debit_account']
+                debit_part_str = origin['debit_partner'] if pd.notna(origin['debit_partner']) else ""
+                match_type = "現金引き出し"
+                confidence = "対象外"
+                is_resolved = True
             
             # 未判定または時間軸探索でマッチしなかった場合の自己完結
             if not is_resolved:
-                related_debit = format_journal_entry(origin['debit_account'], origin['debit_partner'], origin['partner'], origin['debit_amount'])
+                related_debit = format_journal_entry(origin['debit_account'], origin['debit_partner'], origin['description'], origin['debit_amount'])
                 matched_debit_amount = deb_amt
                 debit_acc_str = deb_acc
                 debit_part_str = deb_part if pd.notna(deb_part) else ""
@@ -455,7 +552,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                 is_resolved = True
 
         # --- ステップ2: 取引Noによる複合仕訳の解決 ---
-        if not is_resolved and pd.notna(t_no) and str(t_no).strip() != "":
+        if not is_resolved and has_valid_transaction_no(t_no):
             related_txs = df_j[df_j['transaction_no'] == t_no].copy()
             debits = related_txs[related_txs['debit_amount'] > 0].copy()
             credits = related_txs[related_txs['credit_amount'] > 0].copy()
@@ -510,20 +607,20 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                         purpose = "その他支払"
                     
                     # カード決済の特記（借方に「未払」や「経費」があり、摘要にカード名がある場合）
-                    has_card_keyword = debits['partner'].astype(str).str.contains('|'.join(card_kws_search), na=False).any()
+                    has_card_keyword = debits['description'].astype(str).str.contains('|'.join(card_kws_search), na=False).any()
                     if has_card_keyword and purpose in ["その他支払", "月次支払い", "大口支払い"]:
                         purpose = "カード決済"
                     
                     # 関連借方仕訳の構築
                     debit_lines = []
                     for _, r in debits.iterrows():
-                        debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['partner'], r['debit_amount']))
+                        debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['description'], r['debit_amount']))
                     related_debit = "\n".join(debit_lines)
                     
                     # 関連貸方仕訳の構築
                     credit_lines = []
                     for _, r in credits.iterrows():
-                        credit_lines.append(format_journal_entry(r['credit_account'], r['credit_partner'], r['partner'], r['credit_amount']))
+                        credit_lines.append(format_journal_entry(r['credit_account'], r['credit_partner'], r['description'], r['credit_amount']))
                     related_credit = "\n".join(credit_lines)
                     
                     matched_debit_amount = debit_total
@@ -541,7 +638,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                         
                     is_resolved = True
                 
-        # --- ステップ3: フォールバック (従来の近傍探索) ---
+        # --- ステップ3: フォールバック（まず±5%、なければ±20%へ拡張） ---
         if not is_resolved:
             start_range = o_date - pd.Timedelta(days=2)
             end_range = o_date + pd.Timedelta(days=7)
@@ -549,15 +646,17 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
             near_pays = df_payments[(df_payments['date'] >= start_range) & (df_payments['date'] <= end_range)].copy()
             
             if not near_pays.empty:
-                # 1. 1対1マッチング
+                near_pays = near_pays[near_pays.index != origin.name]
+                # 1. 1対1マッチング。5%以内を優先し、なければ20%まで広げる。
                 near_pays['diff_pct'] = (near_pays['debit_amount'] - o_amt).abs() / o_amt
-                valid_1to1 = near_pays[near_pays['diff_pct'] <= 0.20].sort_values(['pay_priority', 'diff_pct'])
+                tolerance = 0.05 if (near_pays['diff_pct'] <= 0.05).any() else 0.20
+                valid_1to1 = near_pays[near_pays['diff_pct'] <= tolerance].sort_values(['pay_priority', 'diff_pct'])
                 
                 if not valid_1to1.empty:
                     matched_pay = valid_1to1.iloc[0]
-                    match_type = "1対1"
+                    match_type = f"1対1（±{int(tolerance * 100)}%）"
                     purpose = matched_pay['pay_type']
-                    related_debit = format_journal_entry(matched_pay['debit_account'], matched_pay['debit_partner'], matched_pay['partner'], matched_pay['debit_amount'])
+                    related_debit = format_journal_entry(matched_pay['debit_account'], matched_pay['debit_partner'], matched_pay['description'], matched_pay['debit_amount'])
                     matched_debit_amount = matched_pay['debit_amount']
                     debit_acc_str = matched_pay['debit_account']
                     debit_part_str = matched_pay['debit_partner'] if pd.notna(matched_pay['debit_partner']) else ""
@@ -579,17 +678,18 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                     }).reset_index()
                     
                     grouped_pays['diff_pct'] = (grouped_pays['debit_amount'] - o_amt).abs() / o_amt
-                    valid_1toN = grouped_pays[grouped_pays['diff_pct'] <= 0.20].sort_values(['pay_priority', 'diff_pct'])
+                    tolerance = 0.05 if (grouped_pays['diff_pct'] <= 0.05).any() else 0.20
+                    valid_1toN = grouped_pays[grouped_pays['diff_pct'] <= tolerance].sort_values(['pay_priority', 'diff_pct'])
                     
                     if not valid_1toN.empty:
                         matched_g = valid_1toN.iloc[0]
-                        match_type = "1対N"
+                        match_type = f"1対N（±{int(tolerance * 100)}%）"
                         purpose = matched_g['pay_type']
                         
                         type_pays = near_pays[near_pays['pay_type'] == purpose]
                         debit_lines = []
                         for _, r in type_pays.iterrows():
-                            debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['partner'], r['debit_amount']))
+                            debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['description'], r['debit_amount']))
                             
                         related_debit = f"【複数口合算】{purpose}（{matched_g['debit_amount']:.0f}円）\n" + "\n".join(debit_lines)
                         matched_debit_amount = matched_g['debit_amount']
@@ -696,22 +796,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
         return s
 
     def get_clean_partner_for_ar(row):
-        is_deb_ar = bool(re.search(r'売掛|未収|買入金銭債権', str(row.get('debit_account', ''))))
-        is_cred_ar = bool(re.search(r'売掛|未収|買入金銭債権', str(row.get('credit_account', ''))))
-        
-        clean_dp = do_cleanse(row.get('debit_partner'))
-        clean_cp = do_cleanse(row.get('credit_partner'))
-        clean_p = do_cleanse(row.get('partner'))
-        
-        if is_deb_ar:
-            # 発生（借方AR）の場合は、借方補助科目を最優先し、なければ摘要
-            return clean_dp if clean_dp else clean_p
-        elif is_cred_ar:
-            # 回収（貸方AR）の場合は、貸方補助科目を最優先し、なければ摘要
-            return clean_cp if clean_cp else clean_p
-        else:
-            # ARに関係ない仕訳の場合は、とりあえず何か入れておく
-            return clean_dp if clean_dp else (clean_cp if clean_cp else clean_p)
+        return do_cleanse(row.get('ar_partner'))
 
     # 名寄せ用の取引先名
     clean_df['partner_clean'] = clean_df.apply(get_clean_partner_for_ar, axis=1)
@@ -722,17 +807,13 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     
     # 【包含一致 名寄せロジック】
     # 短い名称が長い名称に含まれる場合、同一取引先とみなして名寄せする。
-    raw_partners = [x for x in clean_df['partner_clean'].unique() if x != '（空欄）']
-    raw_partners_sorted = sorted(raw_partners, key=len, reverse=True)
-    alias_map = {}
-    for i, long_p in enumerate(raw_partners_sorted):
-        for short_p in raw_partners_sorted[i+1:]:
-            if len(short_p) >= 3 and short_p in long_p:
-                if len(long_p) > len(short_p):
-                    alias_map[long_p] = short_p
-                    break
-    if alias_map:
-        clean_df['partner_clean'] = clean_df['partner_clean'].replace(alias_map)
+    protected_individuals = set(
+        clean_df.loc[clean_df.get('ar_partner_kind', pd.Series(index=clean_df.index, dtype='object')) == 'individual', 'partner_clean']
+        .dropna().astype(str)
+    )
+    clean_df['partner_clean'] = consolidate_partner_aliases(
+        clean_df['partner_clean'], protected_names=protected_individuals
+    ).fillna('')
         
     # AR（売掛・未収）系科目の判定パターン
     ar_pattern = '売掛|未収|買入金銭債権'
@@ -751,6 +832,27 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     
     # 期中発生仕訳（借方AR、期首仕訳および内部振替を除く）
     df_gen = clean_df[is_debit_ar & ~is_opening & ~is_internal_ar_transfer].copy()
+
+    # 発生原因は残高計算から分離して表示用に分類する。
+    valid_tx = clean_df['transaction_no'].notna() & ~clean_df['transaction_no'].astype(str).str.lower().isin(
+        ['', 'nan', 'none', 'null', '<na>']
+    )
+    sales_row = clean_df['credit_account'].astype(str).str.contains('売上', na=False)
+    sales_transactions = set(clean_df.loc[valid_tx & sales_row, 'transaction_no'].astype(str))
+
+    def classify_ar_origin(row):
+        credit_account = str(row.get('credit_account', ''))
+        if '売上' in credit_account:
+            return '売上起点'
+        tx = row.get('transaction_no')
+        if pd.notna(tx) and str(tx) in sales_transactions:
+            return '売上起点（複合仕訳）'
+        if re.search(r'預金|現金|当座|普通|定期|別段|手形|電信', credit_account):
+            return '預金支出起点・要確認'
+        return 'その他・要確認'
+
+    if not df_gen.empty:
+        df_gen['ar_origin'] = df_gen.apply(classify_ar_origin, axis=1)
     
     # 期中回収仕訳（貸方AR、内部振替を除く）
     df_kai = clean_df[is_credit_ar & ~is_internal_ar_transfer].copy()
@@ -796,7 +898,8 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
             p_gens_list.append({
                 "date": start_date,
                 "debit_amount": op_adj,
-                "debit_account": acc_name
+                "debit_account": acc_name,
+                "ar_origin": "期首残高"
             })
             
         # 次に、期中発生（期首日以外の借方仕訳）を古い順（昇順）に追加する
@@ -805,7 +908,8 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
             p_gens_list.append({
                 "date": row['date'],
                 "debit_amount": row['debit_amount'],
-                "debit_account": row['debit_account']
+                "debit_account": row['debit_account'],
+                "ar_origin": row['ar_origin']
             })
             
         # 回収の総額 `cred_sum` を用いて、古い発生から順次消し込む
@@ -824,14 +928,16 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                 uncollected_gens.append({
                     "date": g['date'],
                     "amount": uncollected_amt,
-                    "debit_account": g['debit_account']
+                    "debit_account": g['debit_account'],
+                    "ar_origin": g['ar_origin']
                 })
             else:
                 # 回収原資が尽きているため、この発生は丸ごと未回収
                 uncollected_gens.append({
                     "date": g['date'],
                     "amount": g_amt,
-                    "debit_account": g['debit_account']
+                    "debit_account": g['debit_account'],
+                    "ar_origin": g['ar_origin']
                 })
                 
         # 未回収明細のうち、31日以上滞留しているものをリストアップする
@@ -856,10 +962,11 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                     "金額": amt,
                     "取引先": p,
                     "勘定科目": ug['debit_account'],
+                    "発生原因": ug['ar_origin'],
                     "評価": eval_str
                 })
                 
-    df_sheet8 = pd.DataFrame(uncollected_items, columns=["発生日", "滞留日数", "金額", "取引先", "勘定科目", "評価"])
+    df_sheet8 = pd.DataFrame(uncollected_items, columns=["発生日", "滞留日数", "金額", "取引先", "勘定科目", "発生原因", "評価"])
     if not df_sheet8.empty:
         df_sheet8 = df_sheet8.sort_values("滞留日数", ascending=False)
         
@@ -874,12 +981,12 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     sheets_info = [
         ("売上計上思想_該当仕訳", df_sheet1, ["日付", "金額", "摘要", "借方科目", "貸方科目", "貸方補助科目"]),
         ("売上計上思想_全売上仕訳", df_sheet2, ["日付", "金額", "摘要", "借方科目", "貸方科目", "貸方補助科目"]),
-        ("売上入金", df_sheet3, ["日付", "金額", "相手科目(借方/貸方)", "摘要", "貸方補助科目"]),
-        ("直入金売上", df_sheet4, ["日付", "金額", "相手科目(借方/貸方)", "摘要", "貸方補助科目"]),
-        ("直払いリスト", df_sheet5, ["日付", "金額", "借方科目", "摘要", "借方補助科目", "カテゴリ"]),
+        ("売上入金", df_sheet3, ["日付", "金額", "売掛金回収額", "実入金額", "差額", "振込手数料", "対応状態", "相手科目(借方/貸方)", "摘要", "貸方補助科目"]),
+        ("直入金売上", df_sheet4, ["日付", "金額", "相手科目(借方/貸方)", "摘要", "取引先", "取引先取得元"]),
+        ("直払いリスト", df_sheet5, ["日付", "金額", "借方科目", "摘要", "借方補助科目", "支払先", "カテゴリ"]),
         ("預金体力推移", df_sheet6, ["対象年月", "月末残高", "月内最低残高", "月内最低残高の記録日"]),
         ("資金移動用途推定", df_sheet7, ["移動日", "借方金額", "貸方金額", "想定用途", "関連借方仕訳", "関連貸方仕訳", "一致区分", "信頼度"]),
-        ("長期未回収売掛", df_sheet8, ["発生日", "滞留日数", "金額", "取引先", "勘定科目", "評価"])
+        ("長期未回収売掛", df_sheet8, ["発生日", "滞留日数", "金額", "取引先", "勘定科目", "発生原因", "評価"])
     ]
     
     # スタイル定義
@@ -892,6 +999,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     fill_red = PatternFill(start_color="FFE8E8", end_color="FFE8E8", fill_type="solid")
     fill_orange = PatternFill(start_color="FFF3E0", end_color="FFF3E0", fill_type="solid")
     fill_yellow = PatternFill(start_color="FFFDE7", end_color="FFFDE7", fill_type="solid")
+    fill_grey = PatternFill(start_color="E7E6E6", end_color="E7E6E6", fill_type="solid")
     
     align_center = Alignment(horizontal="center", vertical="center")
     align_right = Alignment(horizontal="right", vertical="center")
@@ -974,14 +1082,14 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                         
                 # 長期未回収売掛シートでの行背景色（評価に基づく）
                 if sheet_name == "長期未回収売掛":
-                    eval_val = str(row_data[5]) # 評価列 (インデックス5: 6番目の要素)
-                    fill_to_apply = None
-                    if "🔴" in eval_val or "長期滞留" in eval_val:
-                        fill_to_apply = fill_red
-                    elif "🔶" in eval_val or "要整理" in eval_val:
-                        fill_to_apply = fill_orange
-                    elif "⚠️" in eval_val or "注意" in eval_val:
-                        fill_to_apply = fill_yellow
+                    eval_val = str(row_data[cols.index("評価")]) if "評価" in cols else ""
+                    origin_val = str(row_data[cols.index("発生原因")]) if "発生原因" in cols else ""
+                    fill_to_apply = {
+                        "grey": fill_grey,
+                        "red": fill_red,
+                        "orange": fill_orange,
+                        "yellow": fill_yellow,
+                    }.get(select_long_ar_fill_key(origin_val, eval_val))
                         
                     if fill_to_apply:
                         for cell in ws[row_idx]:

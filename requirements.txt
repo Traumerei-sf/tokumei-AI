@@ -3,5 +3,7 @@ pandas
 numpy
 openpyxl
 st-gsheets-connection
+google-api-python-client
+google-auth
 fpdf2>=2.7.8
 requests
