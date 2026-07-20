@@ -205,7 +205,12 @@ def process_journal_single(file: io.BytesIO, file_num: int = 1) -> Tuple[Optiona
 
         def vectorized_clean_amount(series):
             if series is None or series.empty: return pd.to_numeric(series)
-            s = series.astype(str).str.replace(r'[,\¥円]', '', regex=True).str.replace('△', '-', regex=False)
+            # `\¥` はLinuxの正規表現エンジンで不正なエスケープになるため、
+            # 通貨・桁区切り文字はOS非依存のリテラル置換で除去する。
+            s = series.astype(str)
+            for token in (',', '¥', '\\', '円'):
+                s = s.str.replace(token, '', regex=False)
+            s = s.str.replace('△', '-', regex=False)
             s = s.str.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
             s = s.str.replace(r'[^\d.-]', '', regex=True)
             return pd.to_numeric(s, errors='coerce').fillna(0.0)
