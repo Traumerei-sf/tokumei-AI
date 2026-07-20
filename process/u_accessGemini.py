@@ -103,7 +103,7 @@ def exe_gemini_structure_forJournal(prompt: str) -> str:
                     "credit_account": { "type": "INTEGER", "description": "貸方科目の列番号(0開始)。不明ならnull" },
                     "credit_partner": { "type": "INTEGER", "description": "貸方の補助科目、または貸方の取引先名が記載されている列番号(0開始)。存在しない場合はnull" },
                     "credit_amount": { "type": "INTEGER", "description": "貸方金額の列番号(0開始)。不明ならnull" },
-                    "partner": { "type": "INTEGER", "description": "摘要の列番号(0開始)。借方・貸方などの区別は不要で、1つだけ特定してください。不明ならnull" },
+                    "partner": { "type": "INTEGER", "description": "摘要・備考・取引内容の列番号(0開始)。補助科目・取引先列ではなく仕訳の説明文を優先し、1つだけ特定してください。不明ならnull" },
                     "created_at": { "type": "INTEGER", "description": "作成日時/入力日時の列番号(0開始)。不明ならnull" }
                 },
                 "required": ["transaction_no","date", "debit_account","debit_partner", "debit_amount", "credit_account","credit_partner", "credit_amount", "partner", "created_at"]

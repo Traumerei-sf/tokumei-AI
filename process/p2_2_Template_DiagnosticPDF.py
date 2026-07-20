@@ -4,7 +4,7 @@ import os
 from fpdf import FPDF
 from fpdf.fonts import FontFace
 import datetime
-import urllib.parse
+from process.u_googleSheets import read_sheet
 
 # 「問題の本質」の定型文マッピング
 ESSENCE_MAP = {
@@ -33,15 +33,10 @@ def load_essence_map() -> dict:
     Googleスプレッドシートから「問題の本質」を動的に取得する。
     取得失敗時はデフォルトの ESSENCE_MAP を返す。
     """
-    spreadsheet_id = "1UySgxZ6uPpxwSY9t994k-jsmR6WY-t8AAIrgHcxn0N4"
-    worksheet_name = "問題の本質"
-    
     essence = ESSENCE_MAP.copy()
     try:
-        encoded_worksheet = urllib.parse.quote(worksheet_name)
-        csv_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_worksheet}"
-        df_sheet = pd.read_csv(csv_url, header=None)
-        
+        df_sheet = read_sheet("問題の本質", header=None, ttl=0)
+
         # 取得するのはA2～B25程度（ヘッダー行を除くため、index 1から）
         max_rows = min(df_sheet.shape[0], 26)  # B25くらいまでなら最大26行
         for i in range(1, max_rows):

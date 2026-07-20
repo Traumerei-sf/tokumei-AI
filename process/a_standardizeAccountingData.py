@@ -4,11 +4,24 @@ import json
 import re
 from typing import Optional, Dict, List, Tuple
 from process.u_accessGemini import exe_gemini_structure_forJournal, exe_gemini_structure_forBS
+from process.partner_resolution import normalize_description, resolve_partner_columns
 
 # --- 定数定義 ---
 STANDARD_JOURNAL_COLUMNS = [
-    "date", "debit_account", "debit_amount", "credit_account", "credit_amount", "partner", "created_at", "transaction_no", "debit_partner", "credit_partner"
+    "date", "debit_account", "debit_amount", "credit_account", "credit_amount", "description", "partner", "created_at", "transaction_no", "debit_partner", "credit_partner"
 ]
+
+TRANSACTION_NO_NULL_STRINGS = {"", "nan", "none", "null", "<na>"}
+
+
+def normalize_transaction_numbers(series: pd.Series, file_num: int) -> pd.Series:
+    """有効な取引Noだけを文字列化し、ファイル単位の接頭辞を付ける。"""
+    normalized = series.astype("string").str.strip()
+    is_missing = normalized.isna() | normalized.str.lower().isin(TRANSACTION_NO_NULL_STRINGS)
+    normalized = normalized.mask(is_missing, pd.NA)
+    valid = normalized.notna()
+    normalized.loc[valid] = f"{file_num}_" + normalized.loc[valid]
+    return normalized
 
 def load_file_to_df(file: io.BytesIO) -> pd.DataFrame:
     """
@@ -75,7 +88,7 @@ def process_journal_single(file: io.BytesIO, file_num: int = 1) -> Tuple[Optiona
 - debit_amount: 借方金額
 - credit_account: 貸方勘定科目
 - credit_amount: 貸方金額
-- partner: 取引先名称や摘要、備考、または取引内容が書かれた代表的な列の列番号
+- partner: 摘要、備考、取引内容が書かれた列の列番号。補助科目・取引先列ではなく、仕訳の説明文を優先してください。
 - debit_partner: 借方の補助科目、または借方の取引先名が記載されている列（例:「借方 補助科目」「補助科目(借方)」「補助科目」など。存在しない場合は null）
 - credit_partner: 貸方の補助科目、または貸方の取引先名が記載されている列（例:「貸方 補助科目」「補助科目(貸方)」「補助科目」など。存在しない場合は null）
   ※「補助科目」列が借方・貸方で分かれておらず、1つしか無い場合は、debit_partner と credit_partner の両方にその同じ列番号を指定してください。
@@ -129,6 +142,7 @@ def process_journal_single(file: io.BytesIO, file_num: int = 1) -> Tuple[Optiona
         credit_acc_idx = mapping.get("credit_account")
         
         merged_partner = None
+        base_partner = pd.Series(pd.NA, index=range(len(df_raw) - start_row))
         if (debit_part_idx is not None and debit_part_idx < len(df_raw.columns)) or \
            (credit_part_idx is not None and credit_part_idx < len(df_raw.columns)) or \
            (partner_idx is not None and partner_idx < len(df_raw.columns)):
@@ -162,7 +176,9 @@ def process_journal_single(file: io.BytesIO, file_num: int = 1) -> Tuple[Optiona
             merged_partner = debit_series_clean.fillna(credit_series_clean).fillna(base_partner_clean)
         
         for std_name in STANDARD_JOURNAL_COLUMNS:
-            if std_name == "partner" and merged_partner is not None:
+            if std_name == "description":
+                extracted_data["description"] = base_partner.reset_index(drop=True)
+            elif std_name == "partner" and merged_partner is not None:
                 extracted_data["partner"] = merged_partner
             else:
                 col_idx = mapping.get(std_name)
@@ -171,105 +187,97 @@ def process_journal_single(file: io.BytesIO, file_num: int = 1) -> Tuple[Optiona
                 else:
                     extracted_data[std_name] = pd.NA
         df_wide = pd.DataFrame(extracted_data)
+        # 名寄せの根拠監査と法人判定に使うため、正規化前の値を保持する。
+        for raw_column in ("description", "partner", "debit_partner", "credit_partner"):
+            if raw_column in df_wide.columns:
+                df_wide[f"{raw_column}_raw"] = df_wide[raw_column].copy()
         
         # 6. クリーニング
-        def robust_parse_date(val):
-            if pd.isna(val) or str(val).strip() == "": return pd.NaT
-            s = str(val).strip()
-            s = s.translate(str.maketrans('０１２３４５６７８９．', '0123456789/'))
-            era_map = {"令和": 2018, "平成": 1988, "昭和": 1925}
-            for era, base_year in era_map.items():
-                if era in s:
-                    match = re.search(rf"{era}(\d+)年(\d+)月(\d+)日", s)
-                    if match:
-                        y, m, d = match.groups()
-                        s = f"{int(y) + base_year}/{m}/{d}"
-                        break
-            try: return pd.to_datetime(s, errors='coerce')
-            except: return pd.NaT
+        # 6. クリーニング
+        def vectorized_parse_date(series):
+            if series is None or series.empty: return pd.to_datetime(series)
+            s = series.astype(str).str.strip().replace("nan", "")
+            s = s.str.translate(str.maketrans('０１２３４５６７８９．', '0123456789/'))
+            s = s.str.replace(r'令和(\d+)年(\d+)月(\d+)日', lambda m: f"{int(m.group(1))+2018}/{m.group(2)}/{m.group(3)}", regex=True)
+            s = s.str.replace(r'平成(\d+)年(\d+)月(\d+)日', lambda m: f"{int(m.group(1))+1988}/{m.group(2)}/{m.group(3)}", regex=True)
+            s = s.str.replace(r'昭和(\d+)年(\d+)月(\d+)日', lambda m: f"{int(m.group(1))+1925}/{m.group(2)}/{m.group(3)}", regex=True)
+            return pd.to_datetime(s, errors='coerce')
 
-        def clean_amount(val):
-            if pd.isna(val) or str(val).strip() == "": return 0.0
-            s = str(val).replace(',', '').replace('¥', '').replace('円', '').replace('△', '-').strip()
-            s = s.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
-            cleaned = re.sub(r'[^\d.-]', '', s)
-            try: return float(cleaned) if cleaned else 0.0
-            except: return 0.0
+        def vectorized_clean_amount(series):
+            if series is None or series.empty: return pd.to_numeric(series)
+            s = series.astype(str).str.replace(r'[,\¥円]', '', regex=True).str.replace('△', '-', regex=False)
+            s = s.str.translate(str.maketrans('０１２３４５６７８９', '0123456789'))
+            s = s.str.replace(r'[^\d.-]', '', regex=True)
+            return pd.to_numeric(s, errors='coerce').fillna(0.0)
 
         # 型変換
-        df_wide["date"] = df_wide["date"].apply(robust_parse_date)
-        df_wide["created_at"] = df_wide["created_at"].apply(robust_parse_date)
-        df_wide["debit_amount"] = df_wide["debit_amount"].apply(clean_amount)
-        df_wide["credit_amount"] = df_wide["credit_amount"].apply(clean_amount)
+        if "date" in df_wide.columns:
+            df_wide["date"] = vectorized_parse_date(df_wide["date"])
+        if "created_at" in df_wide.columns:
+            df_wide["created_at"] = vectorized_parse_date(df_wide["created_at"])
+        if "debit_amount" in df_wide.columns:
+            df_wide["debit_amount"] = vectorized_clean_amount(df_wide["debit_amount"])
+        if "credit_amount" in df_wide.columns:
+            df_wide["credit_amount"] = vectorized_clean_amount(df_wide["credit_amount"])
 
-        def clean_partner(val):
-            if pd.isna(val) or str(val).strip() == "": return pd.NA
+        # 法人格の正規表現パターン（一つに結合して高速化）
+        corp_pattern = (
+            r"株式会社|有限会社|合資会社|合名会社|合同会社|"
+            r"\(株\)|（株）|\(有\)|（有）|\(合\)|（合）|"
+            r"㈱|㈲|㈴|㈵|法人|"
+            r"カブシキガイシャ|ユウゲンガイシャ|ゴウドウガイシャ|"
+            r"\(カ\)|（カ）|カ\)|\(カ|（カ|カ）|カ\.|\\.カ|"
+            r"\(ユ\)|（ユ）|ユ\)|\(ユ\)|（ユ|ユ）|ユ\.|\\.ユ|"
+            r"トクヒ\)|\(トクヒ|トクヒ"
+        )
+        prefix_pattern = r"^(?:振込|フリコミ|ﾌﾘｺﾐ|振込口|組戻|クミモドシ|クミモド|トウニユウ|トウニュウ|トウニユウグチ|ネット|ネツト)"
+        
+        def vectorized_clean_partner(series):
+            if series is None or series.empty: return series
+            # 0. 文字列化し、欠損値などを空文字に
+            s = series.fillna("").astype(str)
+            # Unicode正規化はapplyが必要だが組み込み関数なので比較的高速
             import unicodedata
-            s = str(val)
+            s = s.apply(lambda x: unicodedata.normalize('NFKC', x) if x else "")
             
-            # 0. Unicode正規化 (半角カタカナを全角に、全角英数を半角に統一し、濁点等も合体)
-            s = unicodedata.normalize('NFKC', s)
-            
-            # 1. プレフィックス（振込、フリコミなど）の除去（先頭一致）
-            prefix_patterns = [
-                r"^(?:振込|フリコミ|ﾌﾘｺﾐ|振込口|組戻|クミモドシ|クミモド|トウニユウ|トウニュウ|トウニユウグチ)",
-                r"^(?:ネット|ネツト)",
-            ]
-            for pat in prefix_patterns:
-                s = re.sub(pat, "", s)
-                
-            # 2. 法人格の除去（全角・半角、カッコ付き、ピリオド、カタカナなど様々なパターン）
-            corp_patterns = [
-                r"株式会社", r"有限会社", r"合資会社", r"合名会社", r"合同会社",
-                r"\(株\)", r"（株）", r"\(有\)", r"（有）", r"\(合\)", r"（合）",
-                r"㈱", r"㈲", r"㈴", r"㈵", r"法人",
-                # カタカナ法人格
-                r"カブシキガイシャ", r"ユウゲンガイシャ", r"ゴウドウガイシャ",
-                r"\(カ\)", r"（カ）", r"カ\)", r"\(カ", r"（カ", r"カ）",
-                r"カ\.", r"\.カ",
-                r"\(ユ\)", r"（ユ）", r"ユ\)", r"\(ユ\)", r"（ユ", r"ユ）",
-                r"ユ\.", r"\.ユ",
-                r"トクヒ\)", r"\(トクヒ", r"トクヒ"
-            ]
-            for pat in corp_patterns:
-                s = re.sub(pat, "", s)
-            
-            # 3. 改行・タブを除去（スペースは後続の処理で利用するため残す）
-            s = s.replace("\n", "").replace("\r", "").replace("\t", "")
-            
-            # 4. 先頭や末尾に取り残された孤立したカッコや記号の除去
-            s = re.sub(r"^[(\[【.\-_ー]+|[)\]】.\-_ー]+$", "", s)
-            
-            s = s.strip()
-            return s if s else pd.NA
+            # ベクトル化された文字列置換 (一括処理)
+            s = s.str.replace(prefix_pattern, "", regex=True)
+            s = s.str.replace(corp_pattern, "", regex=True)
+            s = s.str.replace(r"[\n\r\t]+", "", regex=True)
+            s = s.str.replace(r"^[(\[【.\-_ー]+|[)\]】.\-_ー]+$", "", regex=True)
+            s = s.str.strip().replace("", pd.NA)
+            return s
 
         if "partner" in df_wide.columns:
-            df_wide["partner"] = df_wide["partner"].apply(clean_partner)
+            df_wide["partner"] = vectorized_clean_partner(df_wide["partner"])
         if "debit_partner" in df_wide.columns:
-            df_wide["debit_partner"] = df_wide["debit_partner"].apply(clean_partner)
+            df_wide["debit_partner"] = vectorized_clean_partner(df_wide["debit_partner"])
         if "credit_partner" in df_wide.columns:
-            df_wide["credit_partner"] = df_wide["credit_partner"].apply(clean_partner)
+            df_wide["credit_partner"] = vectorized_clean_partner(df_wide["credit_partner"])
+            
+        if "description" in df_wide.columns:
+            df_wide["description"] = df_wide["description"].apply(normalize_description)
 
         # 取引Noのクレンジング (文字列として統一し、スペース等の不要な文字を除去、欠損値は NA)
         # ※異なるファイル（年度）間で取引Noが重複するのを防ぐため、ファイル番号をプレフィックスとして付与します。
         if "transaction_no" in df_wide.columns:
-            df_wide["transaction_no"] = df_wide["transaction_no"].fillna(pd.NA).astype(str).str.strip().replace(r'^\s*$', pd.NA, regex=True)
-            valid_tx = df_wide["transaction_no"].notna()
-            df_wide.loc[valid_tx, "transaction_no"] = f"{file_num}_" + df_wide.loc[valid_tx, "transaction_no"]
+            df_wide["transaction_no"] = normalize_transaction_numbers(df_wide["transaction_no"], file_num)
 
         # 日付前方埋め
         df_wide["date"] = df_wide["date"].ffill()
         
         # デバッグ表示
-        print("--- DEBUG: Extracted Samples (Wide Format) ---")
-        for col in df_wide.columns:
-            print(f"DEBUG: {col}: {df_wide[col].head(5).tolist()}")
+        # print("--- DEBUG: Extracted Samples (Wide Format) ---")
+        # for col in df_wide.columns:
+        #     print(f"DEBUG: {col}: {df_wide[col].head(5).tolist()}")
 
         # 有効行フィルタ
         df_wide = df_wide[df_wide["date"].notna() & (df_wide["debit_account"].notna() | df_wide["credit_account"].notna())]
         
         if df_wide.empty:
             return None, "有効データなし"
+
+        df_wide = resolve_partner_columns(df_wide)
 
         print(f"--- DEBUG: ファイル{file_num}枚目から、{len(df_wide)}件の取引データを抽出しました ---")
 

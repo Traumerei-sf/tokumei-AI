@@ -1,44 +1,45 @@
 import pandas as pd
-import urllib.parse
 import json
 from typing import Dict, Tuple
 from process.u_accessGemini import exe_gemini_withGoogleSearch_and_structure
+from process.partner_resolution import resolve_partner_columns
+from process.transaction_details import build_purchase_details, build_sales_details
+from process.u_googleSheets import read_sheet
 import streamlit as st
 
 def create_business_list(df_journal: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """営業先リストを作成する（スプレッドシートのB2セルを使用）"""
     target_accounts = ["売上高", "売掛金", "受取手形"]
-    return _create_list_common(df_journal, row_idx=1, col_idx=1, target_accounts=target_accounts, fallback_name="営業先")
+    return _create_list_common(df_journal, row_idx=1, col_idx=1, target_accounts=target_accounts, fallback_name="営業先", partner_column="sales_partner", detail_builder=build_sales_details)
 
 def create_supplier_list(df_journal: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """仕入先リストを作成する（スプレッドシートのB3セルを使用）"""
     target_accounts = ["外注費", "仕入高"]
-    return _create_list_common(df_journal, row_idx=2, col_idx=1, target_accounts=target_accounts, fallback_name="仕入先")
+    return _create_list_common(df_journal, row_idx=2, col_idx=1, target_accounts=target_accounts, fallback_name="仕入先", partner_column="purchase_partner", detail_builder=build_purchase_details)
 
-def _create_list_common(df_journal: pd.DataFrame, row_idx: int, col_idx: int, target_accounts: list, fallback_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _create_list_common(df_journal: pd.DataFrame, row_idx: int, col_idx: int, target_accounts: list, fallback_name: str, partner_column: str, detail_builder=None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     営業先・仕入先リスト作成の共通ロジック。
     """
     # 1. 取引先一覧を抽出
+    df_journal = resolve_partner_columns(df_journal)
     partners = set()
+    if detail_builder is not None:
+        details = detail_builder(df_journal)
+        partners.update(details.loc[details['partner'] != '取引先不明', 'partner'].dropna().unique())
     # 借方・貸方のいずれかに指定科目が含まれる場合、その行の取引先を取得
     mask_debit = df_journal["debit_account"].fillna("").str.contains("|".join(target_accounts))
     mask_credit = df_journal["credit_account"].fillna("").str.contains("|".join(target_accounts))
     mask_target = mask_debit | mask_credit
-    if "partner" in df_journal.columns:
-        partners.update(df_journal[mask_target]["partner"].dropna().unique())
+    if detail_builder is None:
+        partners.update(df_journal[mask_target][partner_column].dropna().unique())
     
     partners = {str(p) for p in partners if pd.notna(p) and str(p).strip() != ""}
     partner_list_str = "\n".join(sorted(list(partners)))
     
-    # 2. Googleスプレッドシートからプロンプトを取得
-    spreadsheet_id = st.secrets["SPREADSHEET_ID"]
-    worksheet_name = "AIプロンプト"
-    encoded_worksheet = urllib.parse.quote(worksheet_name)
-    csv_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_worksheet}"
-    
+    # 2. Googleスプレッドシートからプロンプトを取得(サービスアカウント経由)
     try:
-        df_prompt = pd.read_csv(csv_url, header=None)
+        df_prompt = read_sheet("AIプロンプト", header=None, ttl=0)
         base_prompt = df_prompt.iloc[row_idx, col_idx] if df_prompt.shape[0] > row_idx and df_prompt.shape[1] > col_idx else ""
     except Exception as e:
         print(f"Error fetching prompt: {e}")

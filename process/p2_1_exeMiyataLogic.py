@@ -1,6 +1,14 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional
+from process.partner_resolution import resolve_partner_columns
+from process.transaction_details import (
+    build_customer_relationship_events,
+    build_purchase_details,
+    build_sales_details,
+    calculate_top3_share,
+)
+from process.statutory_payments import evaluate_statutory_payments
 
 def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_data: Optional[Dict] = None) -> pd.DataFrame:
     """
@@ -9,9 +17,12 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
     results = []
     
     # 日付変換の確認
-    df_j = df_journal.copy()
+    df_j = resolve_partner_columns(df_journal)
     df_j['date'] = pd.to_datetime(df_j['date'], errors='coerce')
     df_j = df_j.dropna(subset=['date'])
+    sales_details = build_sales_details(df_j)
+    purchase_details = build_purchase_details(df_j)
+    customer_events = build_customer_relationship_events(df_j)
     
     # 期間の把握
     if not df_j.empty:
@@ -130,7 +141,7 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
         acc = r['credit_account']
         if pd.isna(acc) or not any(k in str(acc) for k in target_accs):
             return False
-        partner_val = r['partner']
+        partner_val = r['description']
         c_partner_val = r['credit_partner'] if 'credit_partner' in r else pd.NA
         
         has_kw = False
@@ -145,7 +156,7 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
         acc = r['debit_account']
         if pd.isna(acc) or not any(k in str(acc) for k in target_accs):
             return False
-        partner_val = r['partner']
+        partner_val = r['description']
         d_partner_val = r['debit_partner'] if 'debit_partner' in r else pd.NA
         
         has_kw = False
@@ -208,7 +219,15 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
     has_juumin_any = df_curr['is_juumin_occur'].any()
     has_shaho_any = df_curr['is_shaho_occur'].any()
 
-    if has_gensen_any or has_juumin_any or has_shaho_any:
+    statutory_result = evaluate_statutory_payments(df_curr)
+    if statutory_result is None:
+        results.append(["① 資金繰り", "税金・社会保険料の納付確認", "なし", "税金・社会保険料の発生データが確認できません", "grey"])
+    else:
+        statutory_status, statutory_color, statutory_comment, _ = statutory_result
+        results.append(["① 資金繰り", "税金・社会保険料の納付確認", statutory_status, statutory_comment, statutory_color])
+
+    # 旧来の件数ベース判定は、項目別金額消込へ置き換え済み。
+    if False and (has_gensen_any or has_juumin_any or has_shaho_any):
         months = sorted(df_curr['year_month'].unique())
         unconfirmed_months = 0
         monthly_retained = []
@@ -438,7 +457,7 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
                 
             # 2年目以降の繰越・開始仕訳を除外するフィルター
             is_carryover = (target_df['date'] > start_date) & (
-                target_df['partner'].astype(str).str.contains('開始仕訳|期首|繰越', na=False) |
+                target_df['description'].astype(str).str.contains('開始仕訳|期首|繰越', na=False) |
                 target_df['debit_account'].astype(str).str.contains('前期繰越|元入金', na=False) |
                 target_df['credit_account'].astype(str).str.contains('前期繰越|元入金', na=False)
             )
@@ -487,7 +506,10 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
             if abs(diff) >= 365:
                 results.append(["② 会計品質", "入金サイト延伸", "なし", "存在しない、または解析エラーです", "grey"])
             else:
-                if diff >= 5:
+                if months_count < 24:
+                    color = "grey"
+                    comment = f"回収期間の差は{diff:+.1f}日（前期間: {ar_days_prev:.1f}日、直近期間: {ar_days_curr:.1f}日）です。ただしデータが{months_count}か月分のため、12か月対12か月の同条件比較ではありません。参考値としてご確認ください。"
+                elif diff >= 5:
                     color = "red"
                     comment = f"回収期間（売掛金回転日数）が前年比で{diff:+.1f}日（前年: {ar_days_prev:.1f}日、当年: {ar_days_curr:.1f}日）と、5日以上延伸しています。支払期限の遅延や回収条件の悪化が発生している懸念があり、早期の回収状況確認が必要です。"
                 elif diff <= 0:
@@ -522,15 +544,31 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
 
     # --- 3. 売上構造 ---
     # 3.1 新規取引先数
-    if 'partner' not in df_j.columns or df_j['partner'].isna().all():
+    known_customer_events = customer_events[customer_events['partner'] != '取引先不明'].copy()
+    if known_customer_events.empty:
         results.append(["③ 売上構造", "新規取引先数", "なし", "取引先データが抽出できなかったため判定できません", "grey"])
     elif months_count >= 13 and not df_prev.empty:
-        partners_curr = set(df_curr[df_curr['is_sales']]['partner'].dropna())
-        partners_prev = set(df_prev[df_prev['is_sales']]['partner'].dropna())
+        customers_curr = known_customer_events[known_customer_events['date'] > boundary_date]
+        customers_prev = known_customer_events[known_customer_events['date'] <= boundary_date]
+        partners_curr = set(customers_curr['partner'].dropna())
+        partners_prev = set(customers_prev['partner'].dropna())
         new_partners = partners_curr - partners_prev
         new_partner_count = len(new_partners)
-        
-        if new_partner_count == 0:
+        prior_sales_count = customers_prev.loc[
+            customers_prev['relationship_source'] == '売上計上', 'partner'
+        ].nunique()
+        prior_recovery_count = customers_prev.loc[
+            customers_prev['relationship_source'] == '売掛金回収', 'partner'
+        ].nunique()
+        relationship_comparable = not (prior_sales_count < 3 and prior_recovery_count > prior_sales_count)
+
+        if not relationship_comparable:
+            color = "grey"
+            comment = (
+                f"前期間は顧客別の売上計上情報が乏しく、売掛金回収から{prior_recovery_count}先の顧客関係を補完しています。"
+                f"名称体系も異なる可能性があるため、新規候補{new_partner_count}先は参考値であり、正確な前年比較はできません。"
+            )
+        elif new_partner_count == 0:
             color = "red"
             comment = "直近1年間の新規取引先が0社です。既存取引先のみへの依存度が高まっており、顧客の離脱や市場変化に対するリスクが増大しています。"
         elif new_partner_count >= 3:
@@ -539,25 +577,37 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
         else:
             color = "yellow"
             comment = f"直近1年間の新規取引先は{new_partner_count}社にとどまっています（1〜2社）。新規顧客の開拓ペースが緩やかであるため、さらなる営業活動の強化が望まれます。"
-        results.append(["③ 売上構造", "新規取引先数", f"{new_partner_count}社", comment, color])
+        new_result = f"参考 {new_partner_count}先" if not relationship_comparable else f"{new_partner_count}社"
+        results.append(["③ 売上構造", "新規取引先数", new_result, comment, color])
     else:
         results.append(["③ 売上構造", "新規取引先数", "なし", "比較対象となる昨年のデータがないため判定できません", "grey"])
 
     # 3.2 新規継続率
-    if 'partner' not in df_j.columns or df_j['partner'].isna().all():
+    if known_customer_events.empty:
         results.append(["③ 売上構造", "新規継続率", "なし", "取引先データが抽出できなかったため判定できません", "grey"])
     elif months_count >= 13 and 'new_partners' in locals() and len(new_partners) > 0:
         retain_count = 0
         for p in new_partners:
-            p_rows = df_curr[df_curr['partner'] == p].sort_values('date')
-            if len(p_rows) > 1:
-                first_date = p_rows.iloc[0]['date']
-                second_date = p_rows.iloc[1]['date']
+            p_rows = customers_curr[customers_curr['partner'] == p].copy()
+            # 複合仕訳の複数行をリピートと誤認しないよう、取引先×日付×取引Noで1取引に集約する。
+            p_rows['_event_tx'] = p_rows['transaction_no'].astype('string')
+            missing_tx = p_rows['_event_tx'].isna() | p_rows['_event_tx'].str.strip().isin(['', 'nan', 'none', 'null', '<NA>'])
+            p_rows.loc[missing_tx, '_event_tx'] = 'NO_TX_' + p_rows.loc[missing_tx, 'date'].astype(str)
+            p_events = p_rows.groupby(['date', '_event_tx'], as_index=False)['amount'].sum().sort_values('date')
+            if len(p_events) > 1:
+                first_date = p_events.iloc[0]['date']
+                second_date = p_events.iloc[1]['date']
                 if (second_date - first_date).days <= 90:
                     retain_count += 1
         
         retention_rate = (retain_count / len(new_partners)) * 100
-        if retention_rate < 20:
+        if 'relationship_comparable' in locals() and not relationship_comparable:
+            color = "grey"
+            comment = (
+                f"新規候補のうち90日以内に2回目の顧客関係が確認できた割合は{retention_rate:.1f}%です。"
+                "ただし前期間の顧客情報を売掛金回収から補完しているため、参考値としてご確認ください。"
+            )
+        elif retention_rate < 20:
             color = "red"
             comment = f"新規取引先のうち3ヶ月以内のリピート率（継続率）が{retention_rate:.1f}%と、20%未満の低水準です。初期のアプローチやサービスの満足度に課題がある可能性があり、定着化の仕組み作りが急務です。"
         elif retention_rate >= 50:
@@ -566,7 +616,12 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
         else:
             color = "yellow"
             comment = f"新規取引先のうち3ヶ月以内のリピート率（継続率）は{retention_rate:.1f}%と、中程度（20%以上50%未満）です。一定の継続性はありますが、さらなるリピート率向上のための施策が求められます。"
-        results.append(["③ 売上構造", "新規継続率", f"{retention_rate:.1f}%", comment, color])
+        retention_result = (
+            f"参考 {retention_rate:.1f}%"
+            if 'relationship_comparable' in locals() and not relationship_comparable
+            else f"{retention_rate:.1f}%"
+        )
+        results.append(["③ 売上構造", "新規継続率", retention_result, comment, color])
     else:
         results.append(["③ 売上構造", "新規継続率", "なし", "新規取引先がいない、または判定材料が不足しているため判定できません", "grey"])
 
@@ -591,9 +646,8 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
         results.append(["③ 売上構造", "粗利率トレンド", "なし", "データが3ヶ月分に満たないため判定できません", "grey"])
 
     # 3.4 上位3社売上集中度
-    sales_by_partner = df_j[df_j['is_sales']].groupby('partner')['sales_amt'].sum().sort_values(ascending=False)
-    if not sales_by_partner.empty and sales_by_partner.sum() > 0:
-        top3_share = (sales_by_partner.head(3).sum() / sales_by_partner.sum()) * 100
+    top3_share = calculate_top3_share(sales_details)
+    if top3_share is not None:
         if top3_share >= 70:
             color = "red"
             comment = f"上位3社への売上集中度が{top3_share:.1f}%と、非常に高い水準（70%以上）にあります。主要取引先の業績や方針変更が自社の経営に直撃するリスクがあるため、顧客の分散化が求められます。"
@@ -609,9 +663,8 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
 
     # --- 4. 仕入コスト ---
     # 4.1 上位3社仕入集中度
-    cogs_by_partner = df_j[df_j['is_cogs']].groupby('partner')['cogs_amt'].sum().sort_values(ascending=False)
-    if not cogs_by_partner.empty and cogs_by_partner.sum() > 0:
-        top3_cogs_share = (cogs_by_partner.head(3).sum() / cogs_by_partner.sum()) * 100
+    top3_cogs_share = calculate_top3_share(purchase_details)
+    if top3_cogs_share is not None:
         if top3_cogs_share >= 70:
             color = "red"
             comment = f"上位3社への仕入集中度が{top3_cogs_share:.1f}%と、非常に高い水準（70%以上）です。仕入先のトラブル時の供給停止リスクや、価格交渉力の低下の恐れがあるため、複数購買先の検討が推奨されます。"
