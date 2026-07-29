@@ -1,6 +1,15 @@
 .venv/
 __pycache__/
 .streamlit/secrets.toml
+.streamlit/secrets.*.toml
+.env
+.env.*
+!.env.example
+*credentials*.json
+*service-account*.json
+*.pem
+*.p12
+*.key
 *.pyc
 .DS_Store
 # Temporary/Test/Reference data folders

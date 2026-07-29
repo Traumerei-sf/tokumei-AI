@@ -13,6 +13,7 @@ from process.transaction_details import (
     consolidate_partner_aliases,
     resolve_payment_partner_name,
 )
+from process.capital_movement import build_capital_movement_list
 
 VALID_TRANSACTION_NULL_STRINGS = {"", "nan", "none", "null", "<na>"}
 
@@ -62,12 +63,14 @@ def exclude_opening_cash_movements(df: pd.DataFrame) -> pd.DataFrame:
 # 後から列幅を変更したい場合は、以下の数値を編集してください。
 # ==========================================================
 BANK_LIST_COLUMN_WIDTHS = {
-    "移動日": 15,
-    "借方金額": 18,
-    "貸方金額": 18,
+    "資金移動日": 16,
+    "移動金額": 18,
+    "用途充当額": 18,
+    "金額差（未充当額）": 20,
+    "金額差率（未充当率）": 18,
     "想定用途": 20,
-    "関連借方仕訳": 45,
-    "関連貸方仕訳": 45,
+    "資金移動仕訳": 48,
+    "用途推定仕訳": 58,
     "一致区分": 15,
     "信頼度": 10
 }
@@ -351,383 +354,9 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
             
         df_sheet6 = pd.DataFrame(monthly_data).sort_values("対象年月")
         
-    # --- 指標18: 資金移動用途推定リスト ---
-    # 起点仕訳: 貸方預金かつ50万円以上
-    is_origin = df_j['credit_account'].str.contains('普通預金|当座預金', na=False) & (df_j['credit_amount'] >= 500000)
-    df_origins = df_j[is_origin].copy()
-    
-    # 支払・移動・税金仕訳の判定関数
-    def get_payment_info(row):
-        acc = str(row['debit_account']) if pd.notna(row['debit_account']) else ""
-        partner = " ".join(
-            str(value) for value in (row.get('description'), row.get('payment_partner'))
-            if pd.notna(value)
-        )
-        
-        # 0. 口座間移動（資金移動）
-        if '預金' in acc or any(k in acc for k in ['当座', '普通', '定期', '別段']):
-            return '口座間移動（資金移動）', 0
-            
-        # 0.5. 現金引き出し
-        if '現金' in acc:
-            return '現金引き出し', 0.5
-            
-        # 1. 給与支払い
-        if any(k in acc for k in ['給料', '役員報酬', '賞与']) or any(k in partner for k in ['給与', '賞与', '役員', '給料']):
-            return '給与支払い', 1
-            
-        # 1.5. 税金・社会保険料
-        if any(k in acc for k in ['租税公課', '預り金', '法定福利費']) or \
-           any(k in partner for k in ['税', '社会保険', '年金', '健保', '国保', '住民税', '所得税', '厚生年金', '税務署', '市役所', '都税', '県税']):
-            return '税金・社会保険料', 1.5
-            
-        # 2. 銀行返済
-        if '借入' in acc or any(k in partner for k in ['返済', '元金', '利息', '融資', '公庫', '保証協会']):
-            return '銀行返済', 2
-            
-        # 3. カード決済
-        card_kws = ['カード', '引き落とし', '決済', 'JC', 'VISA', 'AMEX', 'JCB', 'ニコス', 'NICOS', 'セゾン', 'SAISON', '三井住友', '楽天', 'オリコ', 'ジャックス', 'UC', 'ライフ', 'エポス', 'ダイナース', 'UFJカード', '三菱UFJニコス']
-        if any(k in acc for k in ['未払金', '未払費用']) and any(k in partner for k in card_kws):
-            return 'カード決済', 3
-            
-        # 4. 月次支払い
-        if any(k in acc for k in ['買掛', '未払', '外注']):
-            return '月次支払い', 4
-            
-        # 5. 大口支払い
-        if any(k in acc for k in ['仕入', '設備', '土地', '建物', '車両', '機械', '構築物', 'ソフトウェア', '商標', '特許', 'のれん']):
-            return '大口支払い', 5
-            
-        return None, 99
-        
-    # 支払・移動系仕訳を抽出
-    df_j['pay_type'], df_j['pay_priority'] = zip(*df_j.apply(get_payment_info, axis=1))
-    df_payments = df_j[df_j['pay_type'].notna()].copy()
-    
-    card_kws_search = ['カード', '引き落とし', '決済', 'JC', 'VISA', 'AMEX', 'JCB', 'ニコス', 'NICOS', 'セゾン', 'SAISON', '三井住友', '楽天', 'オリコ', 'ジャックス', 'UC', 'ライフ', 'エポス', 'ダイナース', 'UFJカード', '三菱UFJニコス']
-    
-    estimated_list = []
-    for _, origin in df_origins.iterrows():
-        o_date = origin['date']
-        o_amt = origin['credit_amount']
-        t_no = origin['transaction_no']
-        
-        # --- 自明な複合・単一取引の一括除外フィルター ---
-        is_self_evident = False
-        
-        # A. 取引Noがある場合、その取引No全体の貸借が一致しているかを調べる
-        if has_valid_transaction_no(t_no):
-            related_txs = df_j[df_j['transaction_no'] == t_no]
-            debit_sum = related_txs['debit_amount'].sum()
-            credit_sum = related_txs['credit_amount'].sum()
-            
-            # 貸借の合計金額がほぼ一致している場合（誤差1%以内）
-            if debit_sum > 0 and abs(debit_sum - credit_sum) / debit_sum <= 0.01:
-                # 取引内にカード決済または現金引き出しが含まれているかチェック
-                has_card = False
-                has_cash = False
-                for _, r in related_txs.iterrows():
-                    p_type, _ = get_payment_info(r)
-                    
-                    # 補助科目や摘要にカードキーがある未払金の場合、カード決済に格上げする判定をここでも考慮
-                    has_card_kw = any(k in str(r['description']) or k in str(r['credit_partner']) or k in str(r['debit_partner']) for k in card_kws_search)
-                    if has_card_kw and '未払' in str(r['debit_account']):
-                        p_type = 'カード決済'
-                        
-                    if p_type == 'カード決済':
-                        has_card = True
-                    elif p_type == '現金引き出し':
-                        has_cash = True
-                
-                has_bank_transfer = related_txs['debit_account'].astype(str).str.contains(
-                    '預金|当座|普通|定期|別段', na=False
-                ).any()
+    # 資金移動用途推定は、取引No単位・諸口展開・移動先口座追跡を行う専用ロジックで確定する。
+    df_sheet7 = build_capital_movement_list(df_j)
 
-                # 預金間移動は出力対象として残す。それ以外の明白な取引だけを除外する。
-                is_non_compound_card = has_card and len(related_txs) == 1
-                if not has_cash and not is_non_compound_card and not has_bank_transfer:
-                    is_self_evident = True
-                    
-        # B. 取引Noがない単一行仕訳の場合（金額一致かつカード・現金以外を除外）
-        elif origin['debit_amount'] == origin['credit_amount'] and origin['debit_amount'] > 0:
-            p_type, _ = get_payment_info(origin)
-            
-            has_card_kw = any(k in str(origin['description']) or k in str(origin['credit_partner']) or k in str(origin['debit_partner']) for k in card_kws_search)
-            if has_card_kw and '未払' in str(origin['debit_account']):
-                p_type = 'カード決済'
-                
-            if p_type not in ['カード決済', '現金引き出し', '口座間移動（資金移動）']:
-                is_self_evident = True
-                
-        if is_self_evident:
-            continue
-        
-        # 初期状態の設定
-        matched_debit_amount = 0.0
-        debit_acc_str = "（なし）"
-        debit_part_str = "（なし）"
-        purpose = "用途不明（社長関連資金等）"
-        related_debit = "（なし）"
-        related_credit = format_journal_entry(origin['credit_account'], origin['credit_partner'], origin['description'], origin['credit_amount'])
-        
-        match_type = "なし"
-        confidence = "低"
-        is_resolved = False
-        
-        # --- ステップ1: 同一行での単一仕訳判定 (最優先) ---
-        if not is_resolved and origin['debit_amount'] == origin['credit_amount'] and origin['debit_amount'] > 0:
-            deb_acc = origin['debit_account']
-            deb_part = origin['debit_partner']
-            deb_amt = origin['debit_amount']
-            
-            p_type, p_prio = get_payment_info(origin)
-            purpose = p_type if p_type else "その他支払"
-            
-            # 補助科目や摘要にカードキーがある未払金の場合、カード決済に格上げ
-            has_card_kw = any(k in str(origin['description']) or k in str(origin['credit_partner']) or k in str(origin['debit_partner']) for k in card_kws_search)
-            if has_card_kw and '未払' in str(deb_acc):
-                purpose = "カード決済"
-                
-            # カード決済は利用仕訳を時間軸で探索する。
-            if purpose == "カード決済":
-                start_range = o_date - pd.Timedelta(days=60)
-                end_range = o_date - pd.Timedelta(days=20)
-                
-                card_name = ""
-                for kw in card_kws_search:
-                    if kw in str(origin['description']) or kw in str(origin['credit_partner']) or kw in str(origin['debit_partner']):
-                        card_name = kw
-                        break
-                
-                if card_name:
-                    card_use_cond = df_j['credit_account'].str.contains('未払金|未払費用', na=False) & \
-                                    (df_j['credit_partner'].astype(str).str.contains(card_name, na=False) | \
-                                     df_j['description'].astype(str).str.contains(card_name, na=False))
-                else:
-                    card_use_cond = df_j['credit_account'].str.contains('未払金|未払費用', na=False)
-                    
-                near_card_uses = df_j[card_use_cond & (df_j['date'] >= start_range) & (df_j['date'] <= end_range)].copy()
-                
-                if not near_card_uses.empty:
-                    total_use_amt = near_card_uses['debit_amount'].sum()
-                    debit_lines = []
-                    for _, r in near_card_uses.iterrows():
-                        debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['description'], r['debit_amount']))
-                    related_debit = "\n".join(debit_lines)
-                    
-                    matched_debit_amount = total_use_amt
-                    debit_acc_str = ",".join(near_card_uses['debit_account'].dropna().unique())
-                    debit_part_str = ",".join(near_card_uses['debit_partner'].dropna().unique())
-                    match_type = "1対N"
-                    
-                    diff_pct = abs(total_use_amt - o_amt) / o_amt if o_amt != 0 else 999
-                    if diff_pct <= 0.02:
-                        confidence = "高"
-                    elif diff_pct <= 0.10:
-                        confidence = "中"
-                    else:
-                        confidence = "低"
-                    is_resolved = True
-                    
-            elif purpose == "現金引き出し":
-                purpose = "現金引き出し（用途推定不可）"
-                related_debit = format_journal_entry(
-                    origin['debit_account'], origin['debit_partner'], origin['description'], origin['debit_amount']
-                )
-                matched_debit_amount = origin['debit_amount']
-                debit_acc_str = origin['debit_account']
-                debit_part_str = origin['debit_partner'] if pd.notna(origin['debit_partner']) else ""
-                match_type = "現金引き出し"
-                confidence = "対象外"
-                is_resolved = True
-            
-            # 未判定または時間軸探索でマッチしなかった場合の自己完結
-            if not is_resolved:
-                related_debit = format_journal_entry(origin['debit_account'], origin['debit_partner'], origin['description'], origin['debit_amount'])
-                matched_debit_amount = deb_amt
-                debit_acc_str = deb_acc
-                debit_part_str = deb_part if pd.notna(deb_part) else ""
-                match_type = "単一仕訳直接"
-                confidence = "高"
-                is_resolved = True
-
-        # --- ステップ2: 取引Noによる複合仕訳の解決 ---
-        if not is_resolved and has_valid_transaction_no(t_no):
-            related_txs = df_j[df_j['transaction_no'] == t_no].copy()
-            debits = related_txs[related_txs['debit_amount'] > 0].copy()
-            credits = related_txs[related_txs['credit_amount'] > 0].copy()
-            
-            if not debits.empty:
-                debit_total = debits['debit_amount'].sum()
-                credit_total = credits['credit_amount'].sum()
-                
-                # 複数預金口座からの引き出し（貸方が複数）があり、かつ借方全体の合計がこの貸方1行の金額と一致しない場合、
-                # 借方仕訳の中から、この貸方金額と合計がほぼ一致する組み合わせ（サブセット）を探索する
-                if len(credits) > 1 and abs(debit_total - o_amt) > o_amt * 0.05:
-                    import itertools
-                    matched_subset = None
-                    best_diff = float('inf')
-                    
-                    # 借方仕訳の数が多すぎると組合せ爆発するため、安全のために最大15件に制限
-                    if len(debits) <= 15:
-                        debit_list = list(debits.iterrows())
-                        for r in range(1, len(debit_list) + 1):
-                            for subset in itertools.combinations(debit_list, r):
-                                subset_sum = sum(row['debit_amount'] for _, row in subset)
-                                diff = abs(subset_sum - o_amt)
-                                # 誤差1%以内、かつほぼぴったり一致するものを探索
-                                if diff / o_amt <= 0.01:
-                                    if diff < best_diff:
-                                        best_diff = diff
-                                        matched_subset = subset
-                                        
-                    if matched_subset is not None:
-                        # 一致する特定の組み合わせが見つかった場合、その組み合わせの借方のみを対象とする
-                        matched_indices = [idx for idx, _ in matched_subset]
-                        debits = debits.loc[matched_indices].copy()
-                        debit_total = debits['debit_amount'].sum()
-                        # この貸方口座に対応する特定の借方グループが特定できたため、
-                        # 貸方件数を 1 とみなして安全フィルターを通過させる
-                        credits = credits.loc[credits.index == origin.name].copy()
-                
-                # 値のチェック：複合仕訳内で借方合計と一致するか、あるいは貸方がこの1行のみか
-                # 複数預金口座からの引き出しが混ざっている場合、全借方を安易に紐付けないようにする
-                if len(credits) == 1 or abs(debit_total - o_amt) <= o_amt * 0.05:
-                    # 借方科目から代表用途を特定
-                    debits_types = []
-                    for _, r in debits.iterrows():
-                        p_type, p_prio = get_payment_info(r)
-                        if p_type:
-                            debits_types.append((p_type, p_prio))
-                    
-                    if debits_types:
-                        debits_types.sort(key=lambda x: x[1])
-                        purpose = debits_types[0][0]
-                    else:
-                        purpose = "その他支払"
-                    
-                    # カード決済の特記（借方に「未払」や「経費」があり、摘要にカード名がある場合）
-                    has_card_keyword = debits['description'].astype(str).str.contains('|'.join(card_kws_search), na=False).any()
-                    if has_card_keyword and purpose in ["その他支払", "月次支払い", "大口支払い"]:
-                        purpose = "カード決済"
-                    
-                    # 関連借方仕訳の構築
-                    debit_lines = []
-                    for _, r in debits.iterrows():
-                        debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['description'], r['debit_amount']))
-                    related_debit = "\n".join(debit_lines)
-                    
-                    # 関連貸方仕訳の構築
-                    credit_lines = []
-                    for _, r in credits.iterrows():
-                        credit_lines.append(format_journal_entry(r['credit_account'], r['credit_partner'], r['description'], r['credit_amount']))
-                    related_credit = "\n".join(credit_lines)
-                    
-                    matched_debit_amount = debit_total
-                    debit_acc_str = ",".join(debits['debit_account'].dropna().unique())
-                    debit_part_str = ",".join(debits['debit_partner'].dropna().unique())
-                    match_type = "取引No一致"
-                    
-                    diff_pct = abs(debit_total - o_amt) / o_amt if o_amt != 0 else 999
-                    if diff_pct <= 0.02:
-                        confidence = "高"
-                    elif diff_pct <= 0.10:
-                        confidence = "中"
-                    else:
-                        confidence = "低"
-                        
-                    is_resolved = True
-                
-        # --- ステップ3: フォールバック（まず±5%、なければ±20%へ拡張） ---
-        if not is_resolved:
-            start_range = o_date - pd.Timedelta(days=2)
-            end_range = o_date + pd.Timedelta(days=7)
-            
-            near_pays = df_payments[(df_payments['date'] >= start_range) & (df_payments['date'] <= end_range)].copy()
-            
-            if not near_pays.empty:
-                near_pays = near_pays[near_pays.index != origin.name]
-                # 1. 1対1マッチング。5%以内を優先し、なければ20%まで広げる。
-                near_pays['diff_pct'] = (near_pays['debit_amount'] - o_amt).abs() / o_amt
-                tolerance = 0.05 if (near_pays['diff_pct'] <= 0.05).any() else 0.20
-                valid_1to1 = near_pays[near_pays['diff_pct'] <= tolerance].sort_values(['pay_priority', 'diff_pct'])
-                
-                if not valid_1to1.empty:
-                    matched_pay = valid_1to1.iloc[0]
-                    match_type = f"1対1（±{int(tolerance * 100)}%）"
-                    purpose = matched_pay['pay_type']
-                    related_debit = format_journal_entry(matched_pay['debit_account'], matched_pay['debit_partner'], matched_pay['description'], matched_pay['debit_amount'])
-                    matched_debit_amount = matched_pay['debit_amount']
-                    debit_acc_str = matched_pay['debit_account']
-                    debit_part_str = matched_pay['debit_partner'] if pd.notna(matched_pay['debit_partner']) else ""
-                    
-                    diff = matched_pay['diff_pct']
-                    if diff <= 0.02:
-                        confidence = "高"
-                    elif diff <= 0.10:
-                        confidence = "中"
-                    else:
-                        confidence = "低"
-                else:
-                    # 2. 1対Nマッチング (想定用途グループ化)
-                    grouped_pays = near_pays.groupby('pay_type').agg({
-                        'debit_amount': 'sum',
-                        'pay_priority': 'first',
-                        'debit_account': lambda x: ",".join(map(str, x.astype(str).unique())),
-                        'debit_partner': lambda x: ",".join(map(str, x.dropna().astype(str).unique()))
-                    }).reset_index()
-                    
-                    grouped_pays['diff_pct'] = (grouped_pays['debit_amount'] - o_amt).abs() / o_amt
-                    tolerance = 0.05 if (grouped_pays['diff_pct'] <= 0.05).any() else 0.20
-                    valid_1toN = grouped_pays[grouped_pays['diff_pct'] <= tolerance].sort_values(['pay_priority', 'diff_pct'])
-                    
-                    if not valid_1toN.empty:
-                        matched_g = valid_1toN.iloc[0]
-                        match_type = f"1対N（±{int(tolerance * 100)}%）"
-                        purpose = matched_g['pay_type']
-                        
-                        type_pays = near_pays[near_pays['pay_type'] == purpose]
-                        debit_lines = []
-                        for _, r in type_pays.iterrows():
-                            debit_lines.append(format_journal_entry(r['debit_account'], r['debit_partner'], r['description'], r['debit_amount']))
-                            
-                        related_debit = f"【複数口合算】{purpose}（{matched_g['debit_amount']:.0f}円）\n" + "\n".join(debit_lines)
-                        matched_debit_amount = matched_g['debit_amount']
-                        debit_acc_str = matched_g['debit_account']
-                        debit_part_str = matched_g['debit_partner']
-                        
-                        diff = matched_g['diff_pct']
-                        if diff <= 0.02:
-                            confidence = "高"
-                        elif diff <= 0.10:
-                            confidence = "中"
-                        else:
-                            confidence = "低"
-                            
-        estimated_list.append({
-            "移動日": o_date,
-            "銀行名": origin['credit_partner'] if pd.notna(origin['credit_partner']) else "（空欄）",
-            "預金形態": origin['credit_account'],
-            "借方金額": matched_debit_amount,
-            "貸方金額": o_amt,
-            "借方勘定科目": debit_acc_str,
-            "借方補助科目": debit_part_str if debit_part_str != "" else "（空欄）",
-            "想定用途": purpose,
-            "関連借方仕訳": related_debit,
-            "関連貸方仕訳": related_credit,
-            "一致区分": match_type,
-            "信頼度": confidence
-        })
-        
-    df_sheet7 = pd.DataFrame(estimated_list)
-    if not df_sheet7.empty:
-        # 古い日付が上の行になるように日付（移動日）の昇順でソートする
-        df_sheet7 = df_sheet7.sort_values("移動日", ascending=True)
-        # ご要望の8列のみにフィルタリングし、順番を合わせる
-        df_sheet7 = df_sheet7[["移動日", "借方金額", "貸方金額", "想定用途", "関連借方仕訳", "関連貸方仕訳", "一致区分", "信頼度"]]
-    else:
-        df_sheet7 = pd.DataFrame(columns=["移動日", "借方金額", "貸方金額", "想定用途", "関連借方仕訳", "関連貸方仕訳", "一致区分", "信頼度"])
-        
     # --- 指標19: 長期未回収売掛リスト ---
     # 期間と期首日の算出
     min_date = df_j['date'].min()
@@ -985,7 +614,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
         ("直入金売上", df_sheet4, ["日付", "金額", "相手科目(借方/貸方)", "摘要", "取引先", "取引先取得元"]),
         ("直払いリスト", df_sheet5, ["日付", "金額", "借方科目", "摘要", "借方補助科目", "支払先", "カテゴリ"]),
         ("預金体力推移", df_sheet6, ["対象年月", "月末残高", "月内最低残高", "月内最低残高の記録日"]),
-        ("資金移動用途推定", df_sheet7, ["移動日", "借方金額", "貸方金額", "想定用途", "関連借方仕訳", "関連貸方仕訳", "一致区分", "信頼度"]),
+        ("資金移動用途推定", df_sheet7, ["資金移動日", "移動金額", "用途充当額", "金額差（未充当額）", "金額差率（未充当率）", "想定用途", "資金移動仕訳", "用途推定仕訳", "一致区分", "信頼度"]),
         ("長期未回収売掛", df_sheet8, ["発生日", "滞留日数", "金額", "取引先", "勘定科目", "発生原因", "評価"])
     ]
     
@@ -1033,13 +662,13 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                 
                 # 「資金移動用途推定」シートはセル内改行数に応じて行の高さを広げる
                 if sheet_name == "資金移動用途推定":
-                    idx_debit = cols.index("関連借方仕訳") if "関連借方仕訳" in cols else 4
-                    idx_credit = cols.index("関連貸方仕訳") if "関連貸方仕訳" in cols else 5
-                    val_debit = str(row_data[idx_debit]) if pd.notna(row_data[idx_debit]) else ""
-                    val_credit = str(row_data[idx_credit]) if pd.notna(row_data[idx_credit]) else ""
-                    lines_debit = val_debit.count('\n') + 1
-                    lines_credit = val_credit.count('\n') + 1
-                    max_lines = max(lines_debit, lines_credit)
+                    idx_transfer = cols.index("資金移動仕訳")
+                    idx_purpose = cols.index("用途推定仕訳")
+                    val_transfer = str(row_data[idx_transfer]) if pd.notna(row_data[idx_transfer]) else ""
+                    val_purpose = str(row_data[idx_purpose]) if pd.notna(row_data[idx_purpose]) else ""
+                    lines_transfer = val_transfer.count('\n') + 1
+                    lines_purpose = val_purpose.count('\n') + 1
+                    max_lines = max(lines_transfer, lines_purpose)
                     row_height = max(20, max_lines * 16) # 1行あたり16pt
                     
                 ws.row_dimensions[row_idx].height = row_height
@@ -1056,7 +685,10 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                     elif isinstance(val, (int, float, np.integer, np.floating)):
                         cell.value = val
                         col_name = cols[col_idx-1]
-                        if "金額" in col_name or col_name == "月末残高" or col_name == "月内最低残高":
+                        if col_name == "金額差率（未充当率）":
+                            cell.number_format = "0.0%"
+                            cell.alignment = align_right
+                        elif "金額" in col_name or col_name == "月末残高" or col_name == "月内最低残高":
                             cell.number_format = "#,##0"
                             cell.alignment = align_right
                         elif col_name == "滞留日数":
@@ -1071,7 +703,7 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                     # 資金移動用途推定シートの折り返し・縦位置上揃え設定
                     if sheet_name == "資金移動用途推定":
                         col_name = cols[col_idx-1]
-                        if col_name in ["関連借方仕訳", "関連貸方仕訳"]:
+                        if col_name in ["資金移動日", "資金移動仕訳", "用途推定仕訳"]:
                             cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
                         else:
                             curr_align = cell.alignment
