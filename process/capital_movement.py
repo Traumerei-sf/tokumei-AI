@@ -113,25 +113,24 @@ def _format_entry(account, sub_account, description, amount) -> str:
     return f"【{_text(account)}】【{middle}】（{_amount(amount):,.0f}円）"
 
 
-def _purpose_info(rows: pd.DataFrame) -> tuple[str | None, int]:
-    """諸口を用途にせず、対象となる借方明細と摘要から用途を決める。"""
+def _purpose_info_from_records(records: list[dict]) -> tuple[str | None, int]:
+    """諸口を用途にせず、対象となる借方明細と摘要から用途を決める。(辞書レコード版)"""
     accounts = [
-        _text(value)
-        for value in rows.get("debit_account", pd.Series(dtype=object))
-        if _text(value) and not _is_bank(value) and not SUSPENSE_PATTERN.match(_text(value))
+        _text(r.get("debit_account"))
+        for r in records
+        if _text(r.get("debit_account")) and not _is_bank(r.get("debit_account")) and not SUSPENSE_PATTERN.match(_text(r.get("debit_account")))
     ]
     descriptions = " ".join(
-        _text(value)
-        for column in ("description", "payment_partner", "partner")
-        if column in rows.columns
-        for value in rows[column]
+        _text(r.get(col))
+        for col in ("description", "payment_partner", "partner")
+        for r in records
+        if col in r and pd.notna(r.get(col))
     )
     account_text = " ".join(accounts)
-    # 一行で借方・銀行貸方が対応する場合は、補助科目もその支払固有の用途根拠にできる。
-    if len(rows) == 1 and "debit_partner" in rows.columns:
-        account_text = f"{account_text} {_text(rows.iloc[0].get('debit_partner'))}".strip()
+    if len(records) == 1 and "debit_partner" in records[0]:
+        account_text = f"{account_text} {_text(records[0].get('debit_partner'))}".strip()
     all_text = f"{account_text} {descriptions}"
-    # 税・社会保険の実科目が借方に立つ支払は、摘要中の「給与」等より優先する。
+
     statutory_accounts = [
         "租税公課", "預り金", "法定福利費", "法人税", "消費税", "事業税", "住民税"
     ]
@@ -159,49 +158,38 @@ def _purpose_info(rows: pd.DataFrame) -> tuple[str | None, int]:
     return None, 99
 
 
-def _related_lines(rows: pd.DataFrame, side: str, meaningful_debits_only: bool = False) -> str:
+def _related_lines_from_records(records: list[dict], side: str, meaningful_debits_only: bool = False) -> str:
     account_col = f"{side}_account"
     partner_col = f"{side}_partner"
     amount_col = f"{side}_amount"
     lines = []
-    for _, row in rows.iterrows():
-        amount = _amount(row.get(amount_col))
-        account = _text(row.get(account_col))
+    for r in records:
+        amount = _amount(r.get(amount_col))
+        account = _text(r.get(account_col))
         if amount <= 0 or not account:
             continue
         if meaningful_debits_only and side == "debit":
             if _is_bank(account) or SUSPENSE_PATTERN.match(account):
                 continue
-        lines.append(_format_entry(account, row.get(partner_col), row.get("description"), amount))
+        lines.append(_format_entry(account, r.get(partner_col), r.get("description"), amount))
     return "\n".join(lines) if lines else "（なし）"
 
 
-def _prepare_groups(journal: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
-    work = journal.copy().reset_index(drop=False).rename(columns={"index": "_source_index"})
-    work["_source_order"] = range(len(work))
-    transaction_numbers = work.get("transaction_no", pd.Series(pd.NA, index=work.index))
-    work["_movement_group"] = [
-        _group_key(index, value)
-        for index, value in zip(work["_source_order"], transaction_numbers)
-    ]
-    return [(key, rows.copy()) for key, rows in work.groupby("_movement_group", sort=False)]
-
-
-def _is_transfer_row(row: pd.Series) -> bool:
+def _is_transfer_record(r: dict) -> bool:
     return (
-        _is_bank(row.get("debit_account"))
-        and _is_bank(row.get("credit_account"))
-        and _amount(row.get("debit_amount")) > 0
-        and _amount(row.get("credit_amount")) > 0
+        _is_bank(r.get("debit_account"))
+        and _is_bank(r.get("credit_account"))
+        and _amount(r.get("debit_amount")) > 0
+        and _amount(r.get("credit_amount")) > 0
     )
 
 
-def _is_direct_payment_pair(row: pd.Series) -> bool:
-    debit_account = _text(row.get("debit_account"))
-    debit_amount = _amount(row.get("debit_amount"))
-    credit_amount = _amount(row.get("credit_amount"))
+def _is_direct_payment_record(r: dict) -> bool:
+    debit_account = _text(r.get("debit_account"))
+    debit_amount = _amount(r.get("debit_amount"))
+    credit_amount = _amount(r.get("credit_amount"))
     return (
-        _is_bank(row.get("credit_account"))
+        _is_bank(r.get("credit_account"))
         and not _is_bank(debit_account)
         and not SUSPENSE_PATTERN.match(debit_account)
         and debit_amount > 0
@@ -210,63 +198,79 @@ def _is_direct_payment_pair(row: pd.Series) -> bool:
     )
 
 
-def _build_candidates(groups: Iterable[tuple[str, pd.DataFrame]]) -> list[PaymentCandidate]:
-    """明細対応できる支払は行単位、それ以外の複合仕訳は取引No・口座単位にする。"""
+def _prepare_groups_records(journal: pd.DataFrame) -> list[tuple[str, list[dict]]]:
+    """レコード辞書のリストでグループ化し、DataFrameコピーの大量生成を撤廃する。"""
+    raw_records = journal.to_dict("records")
+    groups_dict: dict[str, list[dict]] = {}
+    
+    for order, r in enumerate(raw_records):
+        r["_source_order"] = order
+        tx_no = r.get("transaction_no")
+        gkey = _group_key(order, tx_no)
+        groups_dict.setdefault(gkey, []).append(r)
+        
+    return list(groups_dict.items())
+
+
+def _build_candidates_from_records(groups: list[tuple[str, list[dict]]]) -> list[PaymentCandidate]:
     candidates: list[PaymentCandidate] = []
     for group_key, rows in groups:
-        # 口座間移動の取引Noは起点専用とし、手数料を含めて用途候補にはしない。
-        if rows.apply(_is_transfer_row, axis=1).any():
+        if any(_is_transfer_record(r) for r in rows):
             continue
-        dates = rows.get("date", pd.Series(dtype="datetime64[ns]")).dropna()
-        if dates.empty:
+        dates = [pd.Timestamp(r["date"]) for r in rows if pd.notna(r.get("date"))]
+        if not dates:
             continue
-        group_date = dates.min()
-        transaction_no = _display_transaction_no(rows.get("transaction_no", pd.Series(pd.NA)).iloc[0])
-        bank_rows = rows[
-            rows["credit_account"].map(_is_bank)
-            & (rows["credit_amount"].map(_amount) > 0)
-        ].copy()
-        if bank_rows.empty:
+        group_date = min(dates)
+        transaction_no = _display_transaction_no(rows[0].get("transaction_no"))
+        bank_rows = [
+            r for r in rows
+            if _is_bank(r.get("credit_account")) and _amount(r.get("credit_amount")) > 0
+        ]
+        if not bank_rows:
             continue
 
-        direct_rows = bank_rows[bank_rows.apply(_is_direct_payment_pair, axis=1)].copy()
-        direct_orders = set(direct_rows["_source_order"].tolist())
-        for _, row in direct_rows.iterrows():
-            one_row = row.to_frame().T
-            purpose, priority = _purpose_info(one_row)
+        direct_rows = [r for r in bank_rows if _is_direct_payment_record(r)]
+        direct_orders = {r["_source_order"] for r in direct_rows}
+        for r in direct_rows:
+            one_record_list = [r]
+            purpose, priority = _purpose_info_from_records(one_record_list)
             if purpose is None:
                 continue
-            order = int(row["_source_order"])
+            order = int(r["_source_order"])
             candidates.append(PaymentCandidate(
                 candidate_id=f"{group_key}|line:{order}",
                 group_key=group_key,
                 transaction_no=transaction_no,
                 order=order,
                 date=group_date,
-                account=_text(row.get("credit_account")),
-                sub_account=_text(row.get("credit_partner")),
-                amount=_amount(row.get("credit_amount")),
+                account=_text(r.get("credit_account")),
+                sub_account=_text(r.get("credit_partner")),
+                amount=_amount(r.get("credit_amount")),
                 purpose=purpose,
                 priority=priority,
-                related_debit=_related_lines(one_row, "debit", meaningful_debits_only=True),
-                related_credit=_related_lines(one_row, "credit"),
+                related_debit=_related_lines_from_records(one_record_list, "debit", meaningful_debits_only=True),
+                related_credit=_related_lines_from_records(one_record_list, "credit"),
                 is_direct_pair=True,
             ))
 
-        remaining_bank_rows = bank_rows[~bank_rows["_source_order"].isin(direct_orders)].copy()
-        if remaining_bank_rows.empty:
+        remaining_bank_rows = [r for r in bank_rows if r["_source_order"] not in direct_orders]
+        if not remaining_bank_rows:
             continue
-        purpose_rows = rows[~rows["_source_order"].isin(direct_orders)].copy()
-        purpose, priority = _purpose_info(purpose_rows)
+        purpose_rows = [r for r in rows if r["_source_order"] not in direct_orders]
+        purpose, priority = _purpose_info_from_records(purpose_rows)
         if purpose is None:
             continue
-        for (account, sub_account), account_rows in remaining_bank_rows.groupby(
-            ["credit_account", "credit_partner"], dropna=False, sort=False
-        ):
-            amount = account_rows["credit_amount"].map(_amount).sum()
+            
+        account_groups: dict[tuple[str, str], list[dict]] = {}
+        for r in remaining_bank_rows:
+            key = (_text(r.get("credit_account")), _text(r.get("credit_partner")))
+            account_groups.setdefault(key, []).append(r)
+
+        for (account, sub_account), account_rows in account_groups.items():
+            amount = sum(_amount(r.get("credit_amount")) for r in account_rows)
             if amount <= 0:
                 continue
-            order = int(account_rows["_source_order"].min())
+            order = min(int(r["_source_order"]) for r in account_rows)
             candidates.append(PaymentCandidate(
                 candidate_id=f"{group_key}|account:{_text(account)}|{_text(sub_account)}|{order}",
                 group_key=group_key,
@@ -278,39 +282,46 @@ def _build_candidates(groups: Iterable[tuple[str, pd.DataFrame]]) -> list[Paymen
                 amount=amount,
                 purpose=purpose,
                 priority=priority,
-                related_debit=_related_lines(purpose_rows, "debit", meaningful_debits_only=True),
-                related_credit=_related_lines(account_rows, "credit"),
+                related_debit=_related_lines_from_records(purpose_rows, "debit", meaningful_debits_only=True),
+                related_credit=_related_lines_from_records(account_rows, "credit"),
                 is_direct_pair=False,
             ))
     return sorted(candidates, key=lambda item: (item.date, item.order, item.candidate_id))
 
 
-def _build_transfer_origins(
-    groups: Iterable[tuple[str, pd.DataFrame]], minimum_amount: float
+def _build_transfer_origins_from_records(
+    groups: list[tuple[str, list[dict]]], minimum_amount: float
 ) -> list[TransferOrigin]:
     origins: list[TransferOrigin] = []
     for group_key, rows in groups:
-        dates = rows.get("date", pd.Series(dtype="datetime64[ns]")).dropna()
-        if dates.empty:
+        dates = [pd.Timestamp(r["date"]) for r in rows if pd.notna(r.get("date"))]
+        if not dates:
             continue
-        transfer_rows = rows[rows.apply(_is_transfer_row, axis=1)].copy()
-        if transfer_rows.empty:
+        transfer_rows = [r for r in rows if _is_transfer_record(r)]
+        if not transfer_rows:
             continue
-        transaction_no = _display_transaction_no(rows.get("transaction_no", pd.Series(pd.NA)).iloc[0])
-        group_columns = ["credit_account", "credit_partner", "debit_account", "debit_partner"]
-        for keys, paired_rows in transfer_rows.groupby(group_columns, dropna=False, sort=False):
-            source_account, source_sub, destination_account, destination_sub = map(_text, keys)
-            amount = paired_rows["credit_amount"].map(_amount).sum()
+        transaction_no = _display_transaction_no(rows[0].get("transaction_no"))
+        
+        pair_groups: dict[tuple[str, str, str, str], list[dict]] = {}
+        for r in transfer_rows:
+            key = (
+                _text(r.get("credit_account")), _text(r.get("credit_partner")),
+                _text(r.get("debit_account")), _text(r.get("debit_partner"))
+            )
+            pair_groups.setdefault(key, []).append(r)
+
+        for (source_account, source_sub, destination_account, destination_sub), paired_rows in pair_groups.items():
+            amount = sum(_amount(r.get("credit_amount")) for r in paired_rows)
             if amount < minimum_amount:
                 continue
-            order = int(paired_rows["_source_order"].min())
+            order = min(int(r["_source_order"]) for r in paired_rows)
             entry_lines = []
-            for _, row in paired_rows.iterrows():
+            for r in paired_rows:
                 entry_lines.append(
-                    f"{pd.Timestamp(row['date']):%Y-%m-%d} No.{transaction_no} "
-                    f"{_account_label(row['credit_account'], row.get('credit_partner'))} → "
-                    f"{_account_label(row['debit_account'], row.get('debit_partner'))}　"
-                    f"{_amount(row.get('credit_amount')):,.0f}円"
+                    f"{pd.Timestamp(r['date']):%Y-%m-%d} No.{transaction_no} "
+                    f"{_account_label(r.get('credit_account'), r.get('credit_partner'))} → "
+                    f"{_account_label(r.get('debit_account'), r.get('debit_partner'))}　"
+                    f"{_amount(r.get('credit_amount')):,.0f}円"
                 )
             origins.append(TransferOrigin(
                 origin_id=(
@@ -320,7 +331,7 @@ def _build_transfer_origins(
                 group_key=group_key,
                 transaction_no=transaction_no,
                 order=order,
-                date=dates.min(),
+                date=min(dates),
                 source_account=source_account,
                 source_sub_account=source_sub,
                 destination_account=destination_account,
@@ -347,19 +358,26 @@ def _allocate(
     candidate_remaining = {candidate.candidate_id: candidate.amount for candidate in candidates}
     allocations: list[Allocation] = []
 
+    # 高速化: 口座名(account)ごとに origins をインデックス化
+    origins_by_account: dict[str, list[TransferOrigin]] = {}
+    for origin in origins:
+        origins_by_account.setdefault(origin.destination_account, []).append(origin)
+
     # 支払発生日ごとに、その時点で有効な最古の資金移動から充当する。
     for candidate in candidates:
-        eligible = [
-            origin
-            for origin in origins
-            if origin_remaining[origin.origin_id] > EPSILON
-            and origin.group_key != candidate.group_key
-            and _same_account(candidate, origin)
-            and origin.date <= candidate.date <= origin.date + pd.Timedelta(days=7)
-        ]
-        for origin in eligible:
+        candidate_origins = origins_by_account.get(candidate.account, [])
+        for origin in candidate_origins:
             if candidate_remaining[candidate.candidate_id] <= EPSILON:
                 break
+            if origin_remaining[origin.origin_id] <= EPSILON:
+                continue
+            if origin.group_key == candidate.group_key:
+                continue
+            if not _same_account(candidate, origin):
+                continue
+            if not (origin.date <= candidate.date <= origin.date + pd.Timedelta(days=7)):
+                continue
+
             allocated = min(
                 origin_remaining[origin.origin_id],
                 candidate_remaining[candidate.candidate_id],
@@ -374,20 +392,26 @@ def _allocate(
             candidate_remaining[candidate.candidate_id] -= allocated
 
     # 将来側で余った移動資金のみ、直前2日間の未使用支払へ補充として充当する。
+    candidates_by_account: dict[str, list[PaymentCandidate]] = {}
+    for candidate in candidates:
+        candidates_by_account.setdefault(candidate.account, []).append(candidate)
+
     for origin in origins:
         if origin_remaining[origin.origin_id] <= EPSILON:
             continue
-        eligible = [
-            candidate
-            for candidate in candidates
-            if candidate_remaining[candidate.candidate_id] > EPSILON
-            and origin.group_key != candidate.group_key
-            and _same_account(candidate, origin)
-            and origin.date - pd.Timedelta(days=2) <= candidate.date < origin.date
-        ]
-        for candidate in eligible:
+        origin_candidates = candidates_by_account.get(origin.destination_account, [])
+        for candidate in origin_candidates:
             if origin_remaining[origin.origin_id] <= EPSILON:
                 break
+            if candidate_remaining[candidate.candidate_id] <= EPSILON:
+                continue
+            if origin.group_key == candidate.group_key:
+                continue
+            if not _same_account(candidate, origin):
+                continue
+            if not (origin.date - pd.Timedelta(days=2) <= candidate.date < origin.date):
+                continue
+
             allocated = min(
                 origin_remaining[origin.origin_id],
                 candidate_remaining[candidate.candidate_id],
@@ -492,9 +516,9 @@ def build_capital_movement_list(
     if journal.empty:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
-    groups = _prepare_groups(journal)
-    origins = _build_transfer_origins(groups, minimum_amount)
-    candidates = _build_candidates(groups)
+    groups = _prepare_groups_records(journal)
+    origins = _build_transfer_origins_from_records(groups, minimum_amount)
+    candidates = _build_candidates_from_records(groups)
     if not origins:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 

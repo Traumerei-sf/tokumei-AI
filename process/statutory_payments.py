@@ -41,7 +41,7 @@ def _transaction_key(index, value):
     return str(value)
 
 
-def _settlement_date(group: pd.DataFrame, journal: pd.DataFrame):
+def _settlement_date(group: pd.DataFrame, bank_credit_journal: pd.DataFrame):
     """直接銀行決済、または未払金等へ振替後の銀行決済日を返す。"""
     bank_words = ("預金", "現金", "当座", "普通", "手形", "電信")
     if group["credit_account"].apply(lambda value: _contains_any(value, bank_words)).any():
@@ -54,11 +54,10 @@ def _settlement_date(group: pd.DataFrame, journal: pd.DataFrame):
     clearing_accounts = group.loc[clearing_mask, "credit_account"].dropna().astype(str).unique()
     start = group["date"].max()
     end = start + pd.Timedelta(days=10)
-    later = journal[(journal["date"] >= start) & (journal["date"] <= end)]
+    later = bank_credit_journal[(bank_credit_journal["date"] >= start) & (bank_credit_journal["date"] <= end)]
     for account in clearing_accounts:
         candidates = later[
             later["debit_account"].fillna("").astype(str).str.contains(account, regex=False)
-            & later["credit_account"].apply(lambda value: _contains_any(value, bank_words))
         ]
         for _, candidate in candidates.iterrows():
             amount = pd.to_numeric(candidate.get("debit_amount"), errors="coerce")
@@ -86,14 +85,28 @@ def build_statutory_payment_ledger(journal: pd.DataFrame):
     data = data.dropna(subset=["date"]).sort_values("date")
 
     data["_tx_key"] = [_transaction_key(index, value) for index, value in zip(data.index, data["transaction_no"])]
-    grouped_transactions = list(data.groupby("_tx_key", sort=False))
+    
+    # 高速化: 預り金・法定福利費を含む取引Noのみを抽出
+    statutory_accounts = ("預り金", "法定福利費")
+    relevant_mask = (
+        data["debit_account"].apply(lambda v: _contains_any(v, statutory_accounts))
+        | data["credit_account"].apply(lambda v: _contains_any(v, statutory_accounts))
+    )
+    relevant_tx_keys = set(data.loc[relevant_mask, "_tx_key"])
+    
+    # 決済日判定用に貸方預金仕訳を事前抽出
+    bank_words = ("預金", "現金", "当座", "普通", "手形", "電信")
+    bank_credit_journal = data[data["credit_account"].apply(lambda v: _contains_any(v, bank_words))].copy()
+
+    relevant_data = data[data["_tx_key"].isin(relevant_tx_keys)]
+    grouped_transactions = list(relevant_data.groupby("_tx_key", sort=False))
 
     payment_counts = 0
     for _, group in grouped_transactions:
         config = CATEGORIES["源泉所得税"]
         debit = pd.to_numeric(group.apply(lambda row: row.get("debit_amount", 0) if _matches_category(row, config, "debit") else 0, axis=1), errors="coerce").fillna(0.0).sum()
         credit = pd.to_numeric(group.apply(lambda row: row.get("credit_amount", 0) if _matches_category(row, config, "credit") else 0, axis=1), errors="coerce").fillna(0.0).sum()
-        if debit > credit and _settlement_date(group, data) is not None:
+        if debit > credit and _settlement_date(group, bank_credit_journal) is not None:
             payment_counts += 1
     month_span = max(1, (data["date"].max().year - data["date"].min().year) * 12
                      + data["date"].max().month - data["date"].min().month + 1)
@@ -117,7 +130,7 @@ def build_statutory_payment_ledger(journal: pd.DataFrame):
             if net > 0:
                 occurrences.append({"date": event_date, "original": net, "remaining": net})
             elif net < 0:
-                paid_date = _settlement_date(group, data)
+                paid_date = _settlement_date(group, bank_credit_journal)
                 if paid_date is not None:
                     payments.append({"date": paid_date, "remaining": -net})
 

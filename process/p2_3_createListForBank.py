@@ -107,6 +107,13 @@ def build_sales_receipt_list(df_receipts: pd.DataFrame, journal: pd.DataFrame) -
     used_fee_indices = set()
     records = []
 
+    # 取引Noごとに手数料インデックスをグループ化しておき、全件走査を防ぐ
+    fee_by_tx = {}
+    for idx, row in fees.iterrows():
+        tx = row.get("transaction_no")
+        if has_valid_transaction_no(tx):
+            fee_by_tx.setdefault(str(tx), []).append((idx, row["_fee_amount"]))
+
     for _, row in df_receipts.iterrows():
         gross_value = pd.to_numeric(row.get("credit_amount"), errors="coerce")
         net_value = pd.to_numeric(row.get("debit_amount"), errors="coerce")
@@ -117,15 +124,13 @@ def build_sales_receipt_list(df_receipts: pd.DataFrame, journal: pd.DataFrame) -
 
         transaction_no = row.get("transaction_no")
         if has_valid_transaction_no(transaction_no) and difference > 0:
-            candidates = fees[
-                (fees["transaction_no"] == transaction_no)
-                & (~fees.index.isin(used_fee_indices))
-                & ((fees["_fee_amount"] - difference).abs() <= 1.0)
-            ]
-            if not candidates.empty:
-                fee_index = candidates.index[0]
-                matched_fee = float(candidates.loc[fee_index, "_fee_amount"])
-                used_fee_indices.add(fee_index)
+            tx_str = str(transaction_no)
+            if tx_str in fee_by_tx:
+                for fee_index, fee_amt in fee_by_tx[tx_str]:
+                    if fee_index not in used_fee_indices and abs(fee_amt - difference) <= 1.0:
+                        matched_fee = float(fee_amt)
+                        used_fee_indices.add(fee_index)
+                        break
 
         status = "一致" if difference == 0 else ("手数料一致" if matched_fee > 0 else "差額要確認")
         partner = row.get("ar_partner")
@@ -139,6 +144,7 @@ def build_sales_receipt_list(df_receipts: pd.DataFrame, journal: pd.DataFrame) -
         })
     return pd.DataFrame(records, columns=columns).sort_values("日付")
 
+
 def cleanse_journal(df: pd.DataFrame) -> pd.DataFrame:
     """
     仕訳データのクレンジング処理。
@@ -147,21 +153,27 @@ def cleanse_journal(df: pd.DataFrame) -> pd.DataFrame:
     """
     df_clean = df.copy()
     
-    # 借方金額がマイナスの場合の処理
+    # 借方金額がマイナスの場合の処理 (ベクトル一括スワップ)
     debit_minus = df_clean['debit_amount'] < 0
     if debit_minus.any():
-        for idx in df_clean[debit_minus].index:
-            row = df_clean.loc[idx]
-            df_clean.loc[idx, ['debit_amount', 'credit_amount', 'debit_account', 'credit_account', 'debit_partner', 'credit_partner']] = \
-                [0.0, abs(row['debit_amount']), row['credit_account'], row['debit_account'], row['credit_partner'], row['debit_partner']]
+        sub_d = df_clean.loc[debit_minus]
+        df_clean.loc[debit_minus, 'debit_amount'] = 0.0
+        df_clean.loc[debit_minus, 'credit_amount'] = sub_d['debit_amount'].abs()
+        df_clean.loc[debit_minus, 'debit_account'] = sub_d['credit_account']
+        df_clean.loc[debit_minus, 'credit_account'] = sub_d['debit_account']
+        df_clean.loc[debit_minus, 'debit_partner'] = sub_d['credit_partner']
+        df_clean.loc[debit_minus, 'credit_partner'] = sub_d['debit_partner']
                 
-    # 貸方金額がマイナスの場合の処理
+    # 貸方金額がマイナスの場合の処理 (ベクトル一括スワップ)
     credit_minus = df_clean['credit_amount'] < 0
     if credit_minus.any():
-        for idx in df_clean[credit_minus].index:
-            row = df_clean.loc[idx]
-            df_clean.loc[idx, ['debit_amount', 'credit_amount', 'debit_account', 'credit_account', 'debit_partner', 'credit_partner']] = \
-                [abs(row['credit_amount']), 0.0, row['credit_account'], row['debit_account'], row['credit_partner'], row['debit_partner']]
+        sub_c = df_clean.loc[credit_minus]
+        df_clean.loc[credit_minus, 'debit_amount'] = sub_c['credit_amount'].abs()
+        df_clean.loc[credit_minus, 'credit_amount'] = 0.0
+        df_clean.loc[credit_minus, 'debit_account'] = sub_c['credit_account']
+        df_clean.loc[credit_minus, 'credit_account'] = sub_c['debit_account']
+        df_clean.loc[credit_minus, 'debit_partner'] = sub_c['credit_partner']
+        df_clean.loc[credit_minus, 'credit_partner'] = sub_c['debit_partner']
                 
     return df_clean
 
@@ -493,10 +505,24 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
     # 全取引先の一覧
     all_partners = set(clean_df['partner_clean'].unique())
     
+    # 取引先別の借方発生合計・貸方回収合計を事前集計 (O(N)化)
+    deb_sums = df_gen.groupby('partner_clean')['debit_amount'].sum().to_dict()
+    cred_sums = df_kai.groupby('partner_clean')['credit_amount'].sum().to_dict()
+    
+    # 取引先別の代表借方科目名を事前作成
+    debit_ar_df = clean_df[is_debit_ar]
+    partner_first_acc = debit_ar_df.groupby('partner_clean')['debit_account'].first().to_dict()
+    
+    # 取引先別の期中発生仕訳（日付昇順）を事前グループ化
+    df_gen_sorted = df_gen.sort_values('date', ascending=True)
+    gens_by_partner = {}
+    for p, group in df_gen_sorted.groupby('partner_clean'):
+        gens_by_partner[p] = group.to_dict('records')
+    
     for p in all_partners:
         op = opening_bal.get(p, 0.0)
-        deb_sum = df_gen[df_gen['partner_clean'] == p]['debit_amount'].sum()
-        cred_sum = df_kai[df_kai['partner_clean'] == p]['credit_amount'].sum()
+        deb_sum = deb_sums.get(p, 0.0)
+        cred_sum = cred_sums.get(p, 0.0)
         
         # 逆算フォールバック：回収額が発生と期首を上回る場合は期首を補正
         op_adj = max(op, cred_sum - deb_sum)
@@ -518,12 +544,10 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
             continue
             
         # 発生仕訳（借方）を古い順（昇順）に整理する。
-        # まず、期首残高（補正後）を start_date (2023-09-01) の仮想的な発生レコードとしてリストの先頭に配置する。
+        # まず、期首残高（補正後）を start_date の仮想的な発生レコードとしてリストの先頭に配置する。
         p_gens_list = []
         if op_adj > 0:
-            # 代表的な科目名を特定
-            p_gens_temp = clean_df[(clean_df['partner_clean'] == p) & is_debit_ar]
-            acc_name = p_gens_temp['debit_account'].iloc[0] if not p_gens_temp.empty else "売掛金"
+            acc_name = partner_first_acc.get(p, "売掛金")
             p_gens_list.append({
                 "date": start_date,
                 "debit_amount": op_adj,
@@ -531,9 +555,8 @@ def create_bank_excel(df_journal: pd.DataFrame, df_bs: pd.DataFrame) -> Tuple[by
                 "ar_origin": "期首残高"
             })
             
-        # 次に、期中発生（期首日以外の借方仕訳）を古い順（昇順）に追加する
-        p_gen_mid = df_gen[df_gen['partner_clean'] == p].sort_values('date', ascending=True)
-        for _, row in p_gen_mid.iterrows():
+        # 次に、期中発生（期首日以外の借方仕訳）を古い順（昇順）に追加する (事前グループからO(1)取得)
+        for row in gens_by_partner.get(p, []):
             p_gens_list.append({
                 "date": row['date'],
                 "debit_amount": row['debit_amount'],

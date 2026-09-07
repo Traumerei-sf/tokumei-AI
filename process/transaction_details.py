@@ -40,7 +40,10 @@ def consolidate_partner_aliases(values: pd.Series, protected_names=None) -> pd.S
                 continue
             if short_name in long_name:
                 aliases[long_name] = short_name
-    return normalized.replace(aliases)
+    # 高速化: Series.replace(dict) ではなく map を使用 (数十倍高速)
+    if aliases:
+        return normalized.map(lambda x: aliases.get(x, x) if pd.notna(x) else x)
+    return normalized
 
 
 def calculate_top3_share(details: pd.DataFrame) -> float | None:
@@ -98,7 +101,12 @@ def build_sales_details(df: pd.DataFrame) -> pd.DataFrame:
     ]
     records = []
 
-    for _, group in journal.groupby("_tx_key", sort=False):
+    # 高速化: 貸方に売上を含む取引Noのみに絞り込んでgroupbyを実行
+    has_sales_mask = _contains(journal["credit_account"], SALES_ACCOUNT_PATTERN)
+    relevant_keys = set(journal.loc[has_sales_mask, "_tx_key"])
+    target_journal = journal[journal["_tx_key"].isin(relevant_keys)]
+
+    for _, group in target_journal.groupby("_tx_key", sort=False):
         credit_sales = group[_contains(group["credit_account"], SALES_ACCOUNT_PATTERN)].copy()
         total_sales = pd.to_numeric(credit_sales.get("credit_amount"), errors="coerce").fillna(0.0).sum()
         if total_sales <= 0:
@@ -150,7 +158,13 @@ def build_purchase_details(df: pd.DataFrame) -> pd.DataFrame:
         _tx_key(index, value) for index, value in zip(journal.index, journal["transaction_no"])
     ]
     records = []
-    for _, group in journal.groupby("_tx_key", sort=False):
+    
+    # 高速化: 借方に仕入系を含む取引Noのみに絞り込んでgroupbyを実行
+    has_purchase_mask = _contains(journal["debit_account"], PURCHASE_ACCOUNT_PATTERN)
+    relevant_keys = set(journal.loc[has_purchase_mask, "_tx_key"])
+    target_journal = journal[journal["_tx_key"].isin(relevant_keys)]
+
+    for _, group in target_journal.groupby("_tx_key", sort=False):
         purchase_rows = group[_contains(group["debit_account"], PURCHASE_ACCOUNT_PATTERN)].copy()
         total_purchase = pd.to_numeric(purchase_rows.get("debit_amount"), errors="coerce").fillna(0.0).sum()
         if total_purchase <= 0:

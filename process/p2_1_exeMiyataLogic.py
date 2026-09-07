@@ -166,8 +166,16 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
             has_kw = True
         return has_kw
 
+    # 貸方に預金等を含む有効な取引Noの集合を事前に作成 (O(1)化)
+    valid_tx_mask = (
+        df_curr['transaction_no'].notna() &
+        ~df_curr['transaction_no'].astype(str).str.strip().isin(["", "<NA>", "nan", "None", "null", "none"])
+    )
+    yokin_credit_mask = df_curr['credit_account'].apply(is_yokin_account)
+    yokin_tx_set = set(df_curr.loc[valid_tx_mask & yokin_credit_mask, 'transaction_no'].astype(str))
+
     # 確定した納付仕訳かどうかの判定
-    def confirm_pay_status(r, df_data, keywords, target_accs):
+    def confirm_pay_status(r, keywords, target_accs):
         if not is_candidate_debit(r, keywords, target_accs):
             return False
         
@@ -177,30 +185,19 @@ def exe_miyata_logic(df_journal: pd.DataFrame, df_bs: pd.DataFrame, sales_index_
             
         # B: 貸方科目に預金等が含まれない場合
         tx_no = r['transaction_no']
-        
-        # B-0: 取引Noがnullの場合
-        if pd.isna(tx_no) or str(tx_no).strip() == "" or str(tx_no) == "<NA>":
+        if pd.isna(tx_no):
+            return False
+        tx_str = str(tx_no).strip()
+        if tx_str == "" or tx_str.lower() in ["<na>", "nan", "none", "null"]:
             return False
             
-        # 同一取引Noの別仕訳を検索
-        same_tx_df = df_data[(df_data['transaction_no'] == tx_no) & (df_data.index != r.name)]
-        
-        # B-1: 別仕訳が存在しない場合
-        if same_tx_df.empty:
-            return False
-            
-        # B-2-2: 同取引Noの別仕訳の貸方に、預金等が含まれるか
-        has_yokin_credit = same_tx_df['credit_account'].apply(is_yokin_account).any()
-        if has_yokin_credit:
-            return True
-            
-        # B-2-1: 含まれない場合
-        return False
+        # 同一取引Noの別仕訳に預金貸方が存在するか
+        return tx_str in yokin_tx_set
 
     # 各仕訳の発生・納付フラグ付与
-    df_curr['is_gensen_pay'] = df_curr.apply(lambda r: confirm_pay_status(r, df_curr, gensen_keywords, acc_targets), axis=1)
-    df_curr['is_juumin_pay'] = df_curr.apply(lambda r: confirm_pay_status(r, df_curr, juumin_keywords, acc_targets), axis=1)
-    df_curr['is_shaho_pay'] = df_curr.apply(lambda r: confirm_pay_status(r, df_curr, shaho_keywords, acc_targets), axis=1)
+    df_curr['is_gensen_pay'] = df_curr.apply(lambda r: confirm_pay_status(r, gensen_keywords, acc_targets), axis=1)
+    df_curr['is_juumin_pay'] = df_curr.apply(lambda r: confirm_pay_status(r, juumin_keywords, acc_targets), axis=1)
+    df_curr['is_shaho_pay'] = df_curr.apply(lambda r: confirm_pay_status(r, shaho_keywords, acc_targets), axis=1)
 
     df_curr['is_gensen_occur'] = df_curr.apply(lambda r: is_candidate_credit(r, gensen_keywords, acc_targets), axis=1)
     df_curr['is_juumin_occur'] = df_curr.apply(lambda r: is_candidate_credit(r, juumin_keywords, acc_targets), axis=1)
